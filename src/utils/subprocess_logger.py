@@ -1,0 +1,72 @@
+# utils/subprocess_logger.py
+import subprocess
+import logging
+from pathlib import Path
+from typing import Optional, Tuple
+
+class SubprocessLogger:
+    """
+    Utility class to run subprocesses with dedicated logging.
+    """
+    
+    def __init__(self, logs_dir: Path = Path("logs")):
+        self.logs_dir = logs_dir
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+    
+    def run_command_with_logging(
+        self, 
+        command: str, 
+        log_filename: str, 
+        command_name: str = "subprocess",
+        trial_id: Optional[int] = None
+    ) -> Tuple[int, str]:
+        """
+        Run a command with output redirected to a log file.
+        
+        Args:
+            command: Shell command to execute
+            log_filename: Name of the log file (without path)
+            command_name: Human-readable name for the command
+            trial_id: Optional trial ID for naming
+            
+        Returns:
+            Tuple of (return_code, log_file_path)
+        """
+        # Create trial-specific log filename if trial_id provided
+        if trial_id is not None:
+            log_filename = f"trial_{trial_id}_{log_filename}"
+        
+        log_file_path = self.logs_dir / log_filename
+        
+        # Write command header to log file
+        with open(log_file_path, 'a') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"Command: {command_name}\n")
+            f.write(f"Full command: {command}\n")
+            f.write(f"Timestamp: {self._get_timestamp()}\n")
+            f.write(f"{'='*60}\n\n")
+        
+        # Run command with output redirection
+        try:
+            with open(log_file_path, 'a') as f:
+                process = subprocess.Popen(
+                    command,
+                    shell=True,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                return_code = process.wait()
+                
+            return return_code, str(log_file_path)
+            
+        except Exception as e:
+            with open(log_file_path, 'a') as f:
+                f.write(f"\nERROR: {str(e)}\n")
+            raise RuntimeError(f"Command '{command_name}' failed: {e}")
+    
+    @staticmethod
+    def _get_timestamp() -> str:
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
