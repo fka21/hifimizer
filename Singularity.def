@@ -1,0 +1,24 @@
+Bootstrap: docker
+From: continuumio/miniconda3
+
+%files
+    /projects/ferenc.kagan/hifimizer-docker/environment.yml /opt/project/environment.yml
+    /projects/ferenc.kagan/hifimizer-docker/src /opt/project/src
+    /home/ferenc.kagan/.cache/optunahub/github.com /root/.cache/optunahub/github.com
+
+%post
+    # Install conda env
+    conda env create -f /opt/project/environment.yml
+    echo "conda activate optimizer" >> ~/.bashrc
+    cp -r /opt/project/src/* /usr/local/bin
+    mkdir -p /tmp/matplotlib_cache
+
+%environment
+    export PATH=/usr/local/bin:$PATH
+    export XDG_CACHE_HOME=/root/.cache
+    export MPLCONFIGDIR=/tmp/matplotlib_cache
+    source /opt/conda/etc/profile.d/conda.sh
+    conda activate optimizer
+
+%runscript
+    exec python /usr/local/bin/hifimizer.py "$@"
