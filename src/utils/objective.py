@@ -160,7 +160,8 @@ class ObjectiveBuilder:
                     command=command,
                     log_filename="hifiasm.log",
                     command_name="hifiasm",
-                    trial_id=trial_id
+                    trial_id=trial_id,
+                    timeout_seconds=24*3600
                 )
                 
                 if return_code != 0:

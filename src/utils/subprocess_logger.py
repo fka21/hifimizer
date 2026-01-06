@@ -14,11 +14,12 @@ class SubprocessLogger:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
     
     def run_command_with_logging(
-        self, 
-        command: str, 
-        log_filename: str, 
+        self,
+        command: str,
+        log_filename: str,
         command_name: str = "subprocess",
-        trial_id: Optional[int] = None
+        trial_id: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> Tuple[int, str]:
         """
         Run a command with output redirected to a log file.
@@ -57,10 +58,37 @@ class SubprocessLogger:
                     text=True,
                     bufsize=1
                 )
-                return_code = process.wait()
-                
+                try:
+                    return_code = process.wait(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    # Attempt to kill process tree if psutil is available
+                    try:
+                        import psutil
+                        parent = psutil.Process(process.pid)
+                        for child in parent.children(recursive=True):
+                            try:
+                                child.kill()
+                            except Exception:
+                                pass
+                        try:
+                            parent.kill()
+                        except Exception:
+                            pass
+                    except Exception:
+                        # Fallback: kill the process
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+
+                    with open(log_file_path, 'a') as lf:
+                        lf.write(f"\nERROR: Command timed out after {timeout_seconds} seconds.\n")
+
+                    # Use conventional timeout exit code 124 to indicate timeout
+                    return 124, str(log_file_path)
+
             return return_code, str(log_file_path)
-            
+
         except Exception as e:
             with open(log_file_path, 'a') as f:
                 f.write(f"\nERROR: {str(e)}\n")

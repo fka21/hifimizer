@@ -53,6 +53,8 @@ class AssemblyEvaluator:
 
         # Compile regex patterns for parsing outputs
         self._compile_patterns()
+        # Load metric weights from config (or use defaults)
+        self.weights = self._load_weights()
 
     
     def _compile_patterns(self):
@@ -326,18 +328,14 @@ class AssemblyEvaluator:
         }
         return metrics
 
-    @staticmethod
-    def calculate_weighted_sum(metrics):
-        """
-        Calculate weighted sum of metrics based on predefined importance.
+    def _load_weights(self):
+        """Load metric weights from a JSON config file, falling back to defaults.
 
-        Args:
-            metrics (dict): Dictionary of metric scores.
-
-        Returns:
-            float: Weighted sum.
+        Search order:
+        - ./weights.json (current working dir)
+        - repository root weights.json (two levels up from this file)
         """
-        weights = {
+        default_weights = {
             'num_contigs': -0.8,
             'length_diff': -1,
             'n50': 1,
@@ -350,7 +348,48 @@ class AssemblyEvaluator:
             'avg_length': 0.8,
             'error_rate': -1,
         }
-        return sum(metrics[key] * weights[key] for key in weights if key in metrics)
+
+        # Candidate locations for user-editable config
+        candidates = [Path.cwd() / "weights.json",
+                      Path(__file__).resolve().parents[2] / "weights.json"]
+
+        for p in candidates:
+            try:
+                if p.exists():
+                    with open(p, 'r') as fh:
+                        loaded = json.load(fh)
+                    # Validate and coerce numeric values
+                    validated = {}
+                    for k, v in default_weights.items():
+                        if k in loaded:
+                            try:
+                                validated[k] = float(loaded[k])
+                            except Exception:
+                                logging.getLogger('AssemblyEval').warning(
+                                    f"Invalid weight for {k} in {p}; using default"
+                                )
+                                validated[k] = v
+                        else:
+                            validated[k] = v
+                    logging.getLogger('AssemblyEval').info(f"Loaded weights from {p}")
+                    return validated
+            except Exception as e:
+                logging.getLogger('AssemblyEval').warning(f"Failed to load weights from {p}: {e}")
+
+        logging.getLogger('AssemblyEval').info("Using default metric weights")
+        return default_weights
+
+    def calculate_weighted_sum(self, metrics):
+        """
+        Calculate weighted sum of metrics using loaded weights.
+
+        Args:
+            metrics (dict): Dictionary of metric scores.
+
+        Returns:
+            float: Weighted sum.
+        """
+        return sum(metrics[k] * self.weights[k] for k in self.weights if k in metrics)
     
     def evaluate_assembly(self, gfa_file, fasta_file, include_busco=True, busco_lineage="metazoa_odb12", download_path=None):
         """

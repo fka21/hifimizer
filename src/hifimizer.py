@@ -309,6 +309,20 @@ try:
                 evaluator.convert_gfa_to_fasta(gfa_file=gfa_file, output_fasta=fasta_file)
 
                 logging.info("Final assembly completed.")
+
+                # Evaluate the final assembly using AssemblyEvaluator
+                try:
+                    logging.info("Evaluating final assembly with AssemblyEvaluator")
+                    final_score = evaluator.evaluate_assembly(
+                        gfa_file=gfa_file,
+                        fasta_file=fasta_file,
+                        include_busco=args.include_busco,
+                        busco_lineage=args.busco_lineage,
+                        download_path=download_path
+                    )
+                    logging.info(f"Final assembly evaluation score: {final_score}")
+                except Exception as eval_err:
+                    logging.error(f"Final assembly evaluation failed: {eval_err}", exc_info=True)
             
             # Cleanup trial assemblies if optimization finished successfully
             logging.info(f"Cleaning up intermediate files in {output_dir}...")

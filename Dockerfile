@@ -7,6 +7,9 @@ WORKDIR /opt/project
 COPY environment.yml .
 RUN conda env create -f environment.yml
 
+# Copy user-editable weights config into the image
+COPY weights.json .
+
 # Activate the conda environment
 SHELL ["conda", "run", "-n", "optimizer", "/bin/bash", "-c"]
 
