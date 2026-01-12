@@ -17,6 +17,7 @@ class MultiCriteriaConvergenceDetector:
         window_size=10,
         significance_level=0.05,
         max_trials: Optional[int] = None,
+        directions: Optional[list] = None,
     ):
         self.detectors = {
             "stagnation": StagnationDetector(
@@ -35,6 +36,9 @@ class MultiCriteriaConvergenceDetector:
         }
         self.convergence_votes = {}
         self.max_trials = max_trials
+        # Directions is a list like ["maximize","minimize",...]
+        # used to aggregate multi-objective values into a scalar for detectors.
+        self.directions = directions
 
     def update(self, current_value, trial_number):
         """Update all detectors and check for convergence"""
@@ -46,9 +50,31 @@ class MultiCriteriaConvergenceDetector:
             self._last_result = (False, [])
             return False, []
         else:
+            # If current_value is a sequence (multi-objective), aggregate to a scalar
+            scalar_value = current_value
+            if isinstance(current_value, (list, tuple)):
+                vals = list(current_value)
+                if self.directions and len(self.directions) >= len(vals):
+                    signs = [
+                        1 if d == "maximize" else -1
+                        for d in self.directions[: len(vals)]
+                    ]
+                else:
+                    signs = [1] * len(vals)
+                # Weighted average with signs so higher scalar_value means improvement
+                scalar_value = sum(s * v for s, v in zip(signs, vals)) / max(
+                    1, len(vals)
+                )
+
+            # Ensure scalar_value is numeric
+            try:
+                float(scalar_value)
+            except Exception:
+                scalar_value = 0.0
+
             results = {}
             for name, detector in self.detectors.items():
-                results[name] = detector.update(current_value, trial_number)
+                results[name] = detector.update(scalar_value, trial_number)
 
             convergence_votes = sum(results.values())
             total_detectors = len(self.detectors)

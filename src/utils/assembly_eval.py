@@ -18,7 +18,7 @@ class AssemblyEvaluator:
     It integrates:
     - Assembly evaluation with `gfastats`
     - Read-to-assembly alignment and evaluation using `gfalign`
-    - Structural completeness scoring with `BUSCO`
+    - Completeness scoring with `BUSCO`
 
     The metrics gathered from these steps are parsed and scored with predefined weights to guide optimization routines
     (e.g., Optuna) in search of parameter configurations that produce the best assemblies.
@@ -81,6 +81,10 @@ class AssemblyEvaluator:
             "error_rate": re.compile(
                 r"error rate:\s+([0-9]+\.?[0-9]*([eE][-+]?[0-9]+)?)"
             ),
+        }
+
+        self.sniffles_patterns = {
+            "num_sv": re.compile(r"Total SVs:\s+(\d+)"),
         }
 
     @staticmethod
@@ -229,7 +233,20 @@ class AssemblyEvaluator:
 
         try:
             self.run_command(self, command, "busco")
-            busco_json_file = f"{output_dir}/short_summary.specific.{lineage}.busco_output_trial_assembly.json"
+            # Locate the BUSCO short summary JSON file produced in the output directory.
+            out_dir_path = Path(output_dir)
+            # BUSCO may include different suffixes in the short_summary filename
+            # depending on the provided -o value; use a glob to find the JSON.
+            json_pattern = f"short_summary.specific.{lineage}.*.json"
+            matches = list(out_dir_path.glob(json_pattern))
+            if not matches:
+                # fallback to a more generic pattern
+                matches = list(out_dir_path.glob("short_summary.*.json"))
+            if not matches:
+                raise FileNotFoundError(
+                    f"BUSCO summary JSON not found in {output_dir} (pattern {json_pattern})"
+                )
+            busco_json_file = str(matches[0])
             return self.parse_busco_results(busco_json_file)
         except RuntimeError:
             self.logger.error("BUSCO evaluation failed")
@@ -317,6 +334,63 @@ class AssemblyEvaluator:
 
         return stats
 
+    def run_sniffles2(self, sam_file, vcf_file=None):
+        """
+        Run sniffles2 on the aligned SAM file to detect structural variants.
+
+        Args:
+            sam_file (str): Path to the aligned SAM file.
+            vcf_file (str, optional): Output VCF file. Defaults to sniffles_output.vcf.
+
+        Returns:
+            dict: Parsed sniffles2 metrics.
+        """
+        if vcf_file is None:
+            vcf_file = "sniffles_output.vcf"
+
+        command = f"sniffles -i {sam_file} -v {vcf_file}"
+
+        try:
+            self.run_command(self, command, "sniffles2")
+            return self.parse_sniffles_vcf(vcf_file)
+        except RuntimeError:
+            self.logger.error("Sniffles2 analysis failed")
+            raise
+
+    def parse_sniffles_vcf(self, vcf_file):
+        """
+        Parse sniffles2 VCF output to extract structural variant metrics.
+
+        Args:
+            vcf_file (str): Path to sniffles VCF file.
+
+        Returns:
+            dict: Dictionary of log-transformed sniffles metrics.
+        """
+        metrics = {
+            "num_sv": 0,
+        }
+
+        try:
+            with open(vcf_file, "r") as f:
+                sv_count = 0
+                for line in f:
+                    if line.startswith("#"):
+                        continue
+                    sv_count += 1
+                
+                # Log-transform the count
+                metrics["num_sv"] = np.log10(sv_count + 1)
+                
+        except FileNotFoundError:
+            self.logger.warning(f"Sniffles VCF file not found: {vcf_file}")
+            metrics["num_sv"] = 0
+        except Exception as e:
+            self.logger.warning(f"Failed to parse sniffles VCF: {e}")
+            metrics["num_sv"] = 0
+
+        return metrics
+
     @staticmethod
     def parse_busco_results(busco_json_file):
         """
@@ -356,8 +430,9 @@ class AssemblyEvaluator:
             "fragmented": -0.7,
             "missing": -1,
             "reads_mapped": 0.8,
-            "avg_length": 0.8,
+            "bases_mapped": 0.8,
             "error_rate": -1,
+            "num_sv": -0.5,
         }
 
         # Candidate locations for user-editable config
@@ -384,14 +459,13 @@ class AssemblyEvaluator:
                                 validated[k] = v
                         else:
                             validated[k] = v
-                    logging.getLogger("AssemblyEval").info(f"Loaded weights from {p}")
                     return validated
             except Exception as e:
                 logging.getLogger("AssemblyEval").warning(
                     f"Failed to load weights from {p}: {e}"
                 )
 
-        logging.getLogger("AssemblyEval").info("Using default metric weights")
+        return default_weights
         return default_weights
 
     def calculate_weighted_sum(self, metrics):
@@ -404,7 +478,10 @@ class AssemblyEvaluator:
         Returns:
             float: Weighted sum.
         """
-        return sum(metrics[k] * self.weights[k] for k in self.weights if k in metrics)
+        # Weighted-sum scoring removed — multicriteria optimization only.
+        raise RuntimeError(
+            "Weighted-sum scoring is disabled; use multicriteria optimization."
+        )
 
     def evaluate_assembly(
         self,
@@ -449,7 +526,12 @@ class AssemblyEvaluator:
 
             combined_metrics = {**metrics_gfastats, **metrics_minimap2}
 
-            # Stage 5: BUSCO evaluation (optional)
+            # Stage 5: Structural variant detection with sniffles2
+            self.logger.info("Running sniffles2 for structural variant detection")
+            metrics_sniffles = self.run_sniffles2(aln_file)
+            combined_metrics.update(metrics_sniffles)
+
+            # Stage 6: BUSCO evaluation (optional)
             if include_busco:
                 self.logger.info("Running BUSCO evaluation")
                 metrics_busco = self.run_busco(
@@ -457,11 +539,8 @@ class AssemblyEvaluator:
                 )
                 combined_metrics.update(metrics_busco)
 
-            # Stage 6: Final scoring
-            self.logger.info("Calculating weighted score")
-            weighted_sum = self.calculate_weighted_sum(combined_metrics)
-
-            return weighted_sum
+            # Return raw metrics dict for multicriteria optimization
+            return combined_metrics
 
         except Exception as e:
             stage_info = self._get_current_stage(e)
@@ -478,6 +557,8 @@ class AssemblyEvaluator:
             return "Alignment statistics parsing"
         elif "gfastats" in error_str:
             return "Assembly statistics"
+        elif "sniffles" in error_str or "sv" in error_str:
+            return "Structural variant detection"
         elif "busco" in error_str:
             return "BUSCO evaluation"
         else:

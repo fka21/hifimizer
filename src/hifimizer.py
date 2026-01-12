@@ -5,6 +5,7 @@ from pathlib import Path
 import optuna.visualization as vis
 import optunahub
 import matplotlib.pyplot as plt
+import math
 from utils.assembly_eval import AssemblyEvaluator
 from utils.optuna_callback import MultiCriteriaConvergenceDetector
 from utils.hifiasm_command import build_hifiasm_command, run_default_hifiasm_assembly
@@ -58,8 +59,8 @@ output_dir = Path(args.output_dir)
 output_dir.mkdir(parents=True, exist_ok=True)
 os.chdir(output_dir)
 
-# Create logs directory - FIXED VERSION
-logs_dir = output_dir / "logs"
+# Create logs directory - using base_path to consolidate in single logs directory
+logs_dir = base_path / "logs"
 logs_dir.mkdir(exist_ok=True, parents=True)
 
 # Configure logging
@@ -113,7 +114,6 @@ if download_path and busco_lineage_exists(download_path, args.busco_lineage):
 else:
     evaluator.download_busco(lineage=args.busco_lineage)
     evaluator.read_subsetting(num_reads=args.num_reads)
-
 # Initialize the objective function for Optuna
 objective_builder = ObjectiveBuilder(
     evaluator=evaluator,
@@ -132,26 +132,31 @@ objective_builder = ObjectiveBuilder(
 # Build the objective function
 objective = objective_builder.build_objective()
 
-# Instantiate the early stopping callback with default parameters
-convergence_detector = MultiCriteriaConvergenceDetector(max_trials=args.num_trials)
-
 
 # Define the convergence callback function
 def convergence_callback(study, trial):
+    # For multi-objective studies, use the trial values aggregated according to
+    # the detector's internal directions. The detector accepts either a scalar
+    # or a sequence of values.
+    current = None
+    if trial.values is not None:
+        current = tuple(trial.values)
+    else:
+        # Fallback to None (detectors should handle this safely)
+        current = None
+
     has_converged, converged_methods = convergence_detector.update(
-        study.best_value, trial.number
+        current, trial.number
     )
 
     if has_converged:
-        # Setting user attributes for convergence status
         study.set_user_attr("converged", True)
         study.set_user_attr("converged_methods", converged_methods)
 
         methods = ", ".join(converged_methods) if converged_methods else "unknown"
         msg = (
-            f"##################################################################\n"
+            f"\n##################################################################\n"
             f"\nOptimization converged at trial: {trial.number}\n"
-            f"Best objective value: {study.best_value:.6f}\n"
             f"Convergence detected by: {methods}\n"
             f"\n##################################################################"
         )
@@ -164,221 +169,113 @@ def convergence_callback(study, trial):
         )
 
 
+# Callback to track best trial so far using aggregate_score user attribute
+def best_tracker_callback(study, trial):
+    try:
+        s = trial.user_attrs.get("aggregate_score", None)
+        if s is None:
+            return
+
+        best_score = study.user_attrs.get("best_score", float("-inf"))
+        if s > best_score:
+            # update stored best
+            study.set_user_attr("best_score", float(s))
+            study.set_user_attr("best_trial", trial.number)
+            params = trial.user_attrs.get("params", dict(trial.params))
+            logging.info(
+                f"New best so far: trial {trial.number} score={s} params={params}"
+            )
+    except Exception:
+        return
+
+
 # Run optimization
 try:
+    # Create a multi-objective Optuna study. Directions derived from evaluator weights.
+    objective_keys = objective_builder.objectives
+    directions = [
+        "maximize" if evaluator.weights.get(k, 0) > 0 else "minimize"
+        for k in objective_keys
+    ]
+    # Create convergence detector configured for multi-objective directions
+    convergence_detector = MultiCriteriaConvergenceDetector(directions=directions)
+
+    # If force rerun requested, attempt to delete existing study from storage
+    load_if_exists = True
+    if args.force_rerun:
+        load_if_exists = False
+        try:
+            logging.info(
+                "--force-rerun specified: deleting existing Optuna study if present."
+            )
+            optuna.delete_study(study_name="no-name", storage=evaluator.db_uri)
+            logging.info(
+                "Deleted existing Optuna study 'no-name'. A fresh study will be created."
+            )
+        except Exception as e:
+            logging.warning(
+                f"Could not delete existing study (may not exist or storage issue): {e}"
+            )
+
+    # Reduce Optuna library verbosity (suppress per-trial value printing)
+    try:
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        optuna.logging.disable_default_handler()
+        logging.getLogger("optuna").setLevel(logging.WARNING)
+        logging.getLogger("optuna").propagate = False
+    except Exception:
+        pass
+
     study = optuna.create_study(
         study_name="no-name",
-        direction="maximize",
+        directions=directions,
         storage=evaluator.db_uri,
-        load_if_exists=True,
+        load_if_exists=load_if_exists,
         sampler=optuna.samplers.TPESampler(),
     )
 
-    # --- Check if previous convergence has been reached ---
-    if not args.force_rerun:
-        logging.info("Checking for previous convergence status in the study...")
-        # Detect if there was already convergence in the stored study
-        if len(study.trials) > 0:
-            logging.info(
-                f"Study has {len(study.trials)} trials. Checking convergence status..."
-            )
-            best_trial = study.best_trial
-            best_value = best_trial.value if best_trial else None
+    # Existing study handling: if not forcing rerun, continue from existing trials.
+    if not args.force_rerun and len(study.trials) > 0:
+        logging.info(
+            f"Resuming existing study with {len(study.trials)} trials. Use --force-rerun to start fresh."
+        )
 
-            # Check if previous convergence marker exists
-            if study.user_attrs.get("converged", False):
-                logging.info(
-                    f"Convergence was already met in a previous run. "
-                    f"Best trial: {best_trial.number if best_trial else 'unknown'}. "
-                    f"Use --force_rerun to override."
-                )
-                sys.exit(0)
-    else:
-        logging.info("Force rerun requested. Ignoring previous convergence status.")
-
-    logging.info("Starting Optuna optimization with up to %d trials.", args.num_trials)
+    logging.info(
+        "Starting Optuna multi-objective optimization with up to %d trials.",
+        args.num_trials,
+    )
+    # No single-objective convergence callbacks are used for multi-objective runs
     study.optimize(
         objective,
         n_trials=args.num_trials,
-        callbacks=[convergence_callback, tpe_acquisition_visualizer],
+        callbacks=[best_tracker_callback, convergence_callback],
     )
-
-    if study.best_trial is not None:
-        trial = study.best_trial
-        # Cleanup trial assemblies if optimization finished successfully
-        patterns = ["trial_*", "alignment.sam", "subset_reads.fa"]
-
-        # Check if best trial is the default (trial 0)
-        if trial.number == 0:
-            logging.info(
-                "Best trial is the default assembly (trial 0). "
-                "No improvement over baseline was found. "
-                "You may try increasing the number of trials, "
-                "though this does not guarantee a better solution."
-                "You can find the assembly in the default_assembly/ directory."
-            )
-
-            logging.info(f"Cleaning up intermediate files in {output_dir}...")
-            for pattern in patterns:
-                for item in output_dir.glob(pattern):
-                    try:
-                        if item.is_dir():
-                            import shutil
-
-                            shutil.rmtree(item)
-                        else:
-                            item.unlink()
-                        logging.info(f"Removed {item}")
-                    except Exception as cleanup_err:
-                        logging.warning(f"Failed to remove {item}: {cleanup_err}")
-            # Nothing more to do here — skip tuned assembly
-        else:
-            logging.info("Best trial found:")
-            logging.info(f"  Value: {trial.value}")
-            logging.info("  Params:")
-            for key, value in trial.params.items():
-                logging.info(f"    {key}: {value}")
-
-            # Setting up the final assembly command
-            base_name = "final_assembly"
-
-            # Choose the suffix based on inputs
-            if args.hic1 and args.hic2:
-                suffix = "hic.hap1.p_ctg"
-            elif args.ul:
-                suffix = "bp.hap1.p_ctg"
-            else:
-                suffix = "bp.p_ctg"
-
-            # Run final assembly with best parameters
-            best_x = trial.params["x"]
-            best_y = trial.params["y"]
-            best_s = trial.params["s"]
-            best_n = trial.params["n"]
-            best_m = trial.params["m"]
-            best_p = trial.params["p"]
-
-            final_hic_params = {}
-            final_ont_params = {}
-
-            if args.hic1 and args.hic2:
-                final_hic_params.update(
-                    {
-                        "s_base": trial.params["s_base"],
-                        "f_perturb": trial.params["f_perturb"],
-                        "l_msjoin": trial.params["l_msjoin"],
-                    }
-                )
-
-            if args.ul:
-                final_ont_params.update(
-                    {
-                        "path_max": trial.params["path_max"],
-                        "path_min": trial.params["path_min"],
-                    }
-                )
-
-            if args.sensitive:
-                final_command = build_hifiasm_command(
-                    prefix=base_name,
-                    x=best_x,
-                    y=best_y,
-                    s=best_s,
-                    n=best_n,
-                    m=best_m,
-                    p=best_p,
-                    haploid_genome_size=KNOWN_GENOME_SIZE,
-                    threads=threads,
-                    sensitive=True,
-                    D=trial.params["D"],
-                    N=trial.params["N"],
-                    max_kocc=trial.params["max_kocc"],
-                    hic1=hic1,
-                    hic2=hic2,
-                    ul=ul,
-                    **final_hic_params,
-                    **final_ont_params,
-                    primary=args.primary,
-                )
-            else:
-                final_command = build_hifiasm_command(
-                    prefix=base_name,
-                    x=best_x,
-                    y=best_y,
-                    s=best_s,
-                    n=best_n,
-                    m=best_m,
-                    p=best_p,
-                    haploid_genome_size=KNOWN_GENOME_SIZE,
-                    threads=threads,
-                    sensitive=False,
-                    hic1=hic1,
-                    hic2=hic2,
-                    ul=ul,
-                    **final_hic_params,
-                    **final_ont_params,
-                    primary=args.primary,
-                )
-
-            final_command += f" {input_reads}"
-
-            # Define file names
-            gfa_file = f"{base_name}.{suffix}.gfa"
-            fasta_file = f"{base_name}.{suffix}.fasta"
-
-            if Path(fasta_file).exists():
-                logging.info(
-                    f"Final assembly FASTA {fasta_file} already exists. Skipping final assembly step."
-                )
-            else:
-                logging.info(
-                    "Running final assembly with best parameters:\n%s", final_command
-                )
-                final_hifiasm_log = logs_dir / "final_hifiasm.log"
-                with open(final_hifiasm_log, "w") as logf:
-                    subprocess.run(
-                        final_command, shell=True, stdout=logf, stderr=subprocess.STDOUT
-                    )
-
-                evaluator.convert_gfa_to_fasta(
-                    gfa_file=gfa_file, output_fasta=fasta_file
-                )
-
-                logging.info("Final assembly completed.")
-
-                # Evaluate the final assembly using AssemblyEvaluator
-                try:
-                    logging.info("Evaluating final assembly with AssemblyEvaluator")
-                    final_score = evaluator.evaluate_assembly(
-                        gfa_file=gfa_file,
-                        fasta_file=fasta_file,
-                        include_busco=args.include_busco,
-                        busco_lineage=args.busco_lineage,
-                        download_path=download_path,
-                    )
-                    logging.info(f"Final assembly evaluation score: {final_score}")
-                except Exception as eval_err:
-                    logging.error(
-                        f"Final assembly evaluation failed: {eval_err}", exc_info=True
-                    )
-
-            # Cleanup trial assemblies if optimization finished successfully
-            logging.info(f"Cleaning up intermediate files in {output_dir}...")
-            for pattern in patterns:
-                for item in output_dir.glob(pattern):
-                    try:
-                        if item.is_dir():
-                            import shutil
-
-                            shutil.rmtree(item)
-                        else:
-                            item.unlink()
-                        logging.info(f"Removed {item}")
-                    except Exception as cleanup_err:
-                        logging.warning(f"Failed to remove {item}: {cleanup_err}")
-
-    else:
+    # Multi-objective optimization completed. No single "best" trial exists.
+    if len(study.trials) == 0:
         logging.info("No successful trials were completed.")
+    else:
+        logging.info(
+            f"Study completed with {len(study.trials)} trials. Use the Pareto front and per-trial metrics to select a preferred solution."
+        )
+
+        # Track best trial by aggregate_score user attribute (higher is better)
+        best_trial = None
+        best_score = float("-inf")
+        for t in study.trials:
+            try:
+                s = t.user_attrs.get("aggregate_score", None)
+                if s is not None and s > best_score:
+                    best_score = s
+                    best_trial = t
+            except Exception:
+                continue
+
+        if best_trial is not None:
+            logging.info(
+                f"\n############################################\n"
+                f"\nBest trial by aggregate_score: {best_trial.number} score={best_score} params={best_trial.user_attrs.get('params', {})}\n"
+                f"\n############################################\n"
+            )
 
 except Exception as e:
     logging.error(f"Optimization failed: {e}", exc_info=True)
@@ -390,40 +287,215 @@ except Exception as e:
 optuna_dir = Path("optuna_output")
 optuna_dir.mkdir(exist_ok=True, parents=True)
 
-# Save visualizations as interactive HTML files
-vis.plot_optimization_history(study).write_html(
-    optuna_dir / "optuna_optimization_history.html"
-)
-vis.plot_param_importances(study).write_html(
-    optuna_dir / "optuna_param_importance.html"
-)
-vis.plot_parallel_coordinate(study).write_html(
-    optuna_dir / "optuna_parallel_coordinates.html"
-)
-vis.plot_contour(study).write_html(optuna_dir / "optuna_contour_plot.html")
+# Save visualizations as interactive HTML files per metric (multi-objective requires a target)
+for metric in objective_builder.objectives:
+    try:
+        metric_dir = optuna_dir / metric
+        metric_dir.mkdir(parents=True, exist_ok=True)
 
-# Extract parameter names for acquisition function visualization
-param_names = list(study.best_trial.params.keys())
-# Remove params that are not always present
-for t in study.trials:
-    t.params = {k: v for k, v in t.params.items() if v is not None}
-# Extract TPE samples trials
-available_trials = list(tpe_acquisition_visualizer.log_objects.keys())
-
-output_dir = "optuna_output/acquisition_plots"
-os.makedirs(output_dir, exist_ok=True)
-
-for trial_num in available_trials:
-    if (
-        trial_num == 0
-    ):  # skip the default assembly trial as this does not parameters set
-        continue
-    for param in param_names:
         try:
-            fig = tpe_acquisition_visualizer.plot(study, trial_num, param)
-            fig.savefig(
-                os.path.join(output_dir, f"acquisition_trial_{trial_num}_{param}.png")
+            vis.plot_optimization_history(study, target=metric).write_html(
+                metric_dir / "optuna_optimization_history.html"
             )
-            plt.close(fig)
         except Exception as e:
-            print(f"Failed to plot trial {trial_num}, param {param}: {e}")
+            logging.warning(
+                f"[{metric}] Failed to create optimization history plot: {e}"
+            )
+
+        try:
+            vis.plot_param_importances(study, target=metric).write_html(
+                metric_dir / "optuna_param_importance.html"
+            )
+        except Exception as e:
+            logging.warning(f"[{metric}] Failed to create param importance plot: {e}")
+
+        try:
+            vis.plot_parallel_coordinate(study, target=metric).write_html(
+                metric_dir / "optuna_parallel_coordinates.html"
+            )
+        except Exception as e:
+            logging.warning(
+                f"[{metric}] Failed to create parallel coordinate plot: {e}"
+            )
+
+        try:
+            vis.plot_contour(study, target=metric).write_html(
+                metric_dir / "optuna_contour_plot.html"
+            )
+        except Exception as e:
+            logging.warning(f"[{metric}] Failed to create contour plot: {e}")
+
+    except Exception as e:
+        logging.warning(f"Failed to create visualizations for metric {metric}: {e}")
+
+# Additional per-metric plots and Pareto front (for multi-objective)
+try:
+    # Determine metric keys: for multi-objective, use objective_builder.objectives
+    # Pareto front
+    try:
+        vis.plot_pareto_front(study).write_html(optuna_dir / "optuna_pareto_front.html")
+    except Exception as e:
+        logging.warning(f"Failed to create pareto front plot: {e}")
+
+    # Per-objective optimization history from trial.values
+    for idx, metric in enumerate(objective_builder.objectives):
+        xs = []
+        ys = []
+        for t in study.trials:
+            if t.values is None:
+                continue
+            try:
+                val = t.values[idx]
+                if val is None or (
+                    isinstance(val, float) and (math.isnan(val) or math.isinf(val))
+                ):
+                    continue
+                xs.append(t.number)
+                ys.append(val)
+            except Exception:
+                continue
+        if xs and ys:
+            plt.figure()
+            plt.scatter(xs, ys)
+            plt.xlabel("trial")
+            plt.ylabel(metric)
+            plt.title(f"Optimization history: {metric}")
+            # save PNG per-metric into metric directory if created, else optuna_dir
+            metric_dir = optuna_dir / metric
+            if not metric_dir.exists():
+                metric_dir = optuna_dir
+            plt.savefig(metric_dir / f"optuna_history_{metric}.png")
+            plt.close()
+except Exception as e:
+    logging.warning(f"Failed to create additional metric visualizations: {e}")
+
+# --- FINAL ASSEMBLY: run with best parameters and evaluate ---
+try:
+    if best_trial is not None:
+        # Extract params (prefer stored user_attrs, fallback to trial.params)
+        try:
+            best_params = best_trial.user_attrs.get("params", dict(best_trial.params))
+        except Exception:
+            best_params = dict(best_trial.params)
+
+        # Build hifiasm command for final assembly
+        hifiasm_kwargs = dict(
+            prefix="final_assembly",
+            haploid_genome_size=KNOWN_GENOME_SIZE,
+            threads=threads,
+            sensitive=args.sensitive,
+            primary=args.primary,
+            hic1=hic1,
+            hic2=hic2,
+            ul=ul,
+        )
+
+        # copy relevant optimized parameters if present
+        for key in [
+            "x",
+            "y",
+            "s",
+            "n",
+            "m",
+            "p",
+            # sensitive tuning params
+            "D",
+            "N",
+            "max_kocc",
+            # Hi-C specific params
+            "s_base",
+            "f_perturb",
+            "l_msjoin",
+            # UL-specific params
+            "path_max",
+            "path_min",
+        ]:
+            if key in best_params:
+                hifiasm_kwargs[key] = best_params[key]
+
+        try:
+            final_cmd = build_hifiasm_command(**hifiasm_kwargs) + f" {input_reads}"
+        except Exception as e:
+            logging.error(f"Failed to build final hifiasm command: {e}")
+            final_cmd = None
+
+        if final_cmd:
+            from utils.subprocess_logger import SubprocessLogger
+
+            runner = SubprocessLogger(logs_dir=logs_dir)
+            logging.info(f"Running final assembly with best params: {final_cmd}")
+            try:
+                rc, log_path = runner.run_command_with_logging(
+                    command=final_cmd,
+                    log_filename="hifiasm.log",
+                    command_name="hifiasm",
+                    trial_id="best",
+                    timeout_seconds=24 * 3600,
+                )
+            except Exception as e:
+                logging.error(f"Final hifiasm run failed: {e}")
+                rc = -1
+
+            if rc == 0:
+                # Find generated GFA file(s) for final assembly
+                gfa_candidates = list(Path.cwd().glob("final_assembly*.bp.p_ctg.gfa"))
+                if not gfa_candidates:
+                    logging.warning(
+                        "No final assembly GFA files found after hifiasm run"
+                    )
+                else:
+                    final_gfa = str(gfa_candidates[0])
+                    # Choose fasta output name based on GFA
+                    fasta_out = str(Path(final_gfa).with_suffix(".fasta"))
+
+                    # Explicitly generate FASTA from GFA since hifiasm may not produce one
+                    try:
+                        AssemblyEvaluator.convert_gfa_to_fasta(final_gfa, fasta_out)
+                        logging.info(f"Generated FASTA from GFA: {fasta_out}")
+                    except Exception as e:
+                        logging.warning(f"Failed to auto-generate FASTA from GFA: {e}")
+
+                    # Ensure evaluator uses 'best' trial id so logs are prefixed accordingly
+                    try:
+                        evaluator.trial_id = "best"
+                    except Exception:
+                        pass
+
+                    logging.info(f"Evaluating final assembly: {final_gfa}")
+                    try:
+                        metrics = evaluator.evaluate_assembly(
+                            gfa_file=final_gfa,
+                            fasta_file=fasta_out,
+                            include_busco=args.include_busco,
+                            busco_lineage=args.busco_lineage,
+                            download_path=download_path,
+                        )
+                        logging.info(f"Final assembly metrics: {metrics}")
+                    except Exception as e:
+                        logging.error(f"Final assembly evaluation failed: {e}")
+
+            else:
+                logging.error(f"Final hifiasm run exited with code {rc}")
+
+        # Remove trial assemblies and associated files
+        try:
+            import shutil
+
+            removed = 0
+            for p in Path.cwd().rglob("trial_assembly*"):
+                try:
+                    if p.is_file():
+                        p.unlink()
+                        removed += 1
+                    elif p.is_dir():
+                        shutil.rmtree(p)
+                        removed += 1
+                except Exception:
+                    logging.warning(f"Failed to remove trial artifact: {p}")
+            logging.info(f"Cleaned up {removed} trial assembly artifacts.")
+        except Exception as e:
+            logging.warning(f"Failed to clean trial assemblies: {e}")
+    else:
+        logging.info("No best trial identified; skipping final assembly run.")
+except Exception as e:
+    logging.error(f"Final assembly/evaluation failed: {e}")
