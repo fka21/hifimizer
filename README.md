@@ -11,14 +11,20 @@ The primary goal is to identify parameter configurations that maximize assembly 
 
 ## Core idea
 
-Genome assemblers expose dozens of parameters, many of which interact non-linearly.
+Genome assemblers use dozens of parameters, many of which interact non-linearly.
 Hifimizer treats assembly as an optimization problem:
 
 - parameter space → hifiasm arguments
 - objective function → assembly quality metrics
 - optimizer → Bayesian optimization (Optuna)
 
-This allows reproducible, data-driven tuning of assembly pipelines.
+> **Note**
+>
+> Due to the stochastic nature of Bayesian optimization and adaptive sampling,
+> the *exact sequence of trials and the final best solution* may vary between runs,
+> even when random seeds are set.
+> While individual components are seeded where possible, full end-to-end
+> determinism is not guaranteed, especially under parallel execution.
 
 ---
 
@@ -77,4 +83,4 @@ apptainer exec \
 * Genome size estimate
 * hifiasm
 * Sufficient compute for repeated assemblies
-* Patience...
+* Patience
