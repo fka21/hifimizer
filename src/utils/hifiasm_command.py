@@ -1,21 +1,36 @@
 import logging
 import subprocess
 from utils.subprocess_logger import SubprocessLogger
+from pathlib import Path
 
-loggerClass = SubprocessLogger()
 logger = logging.getLogger(__name__)
 
+
 def build_hifiasm_command(
-    prefix='trial_assembly',
-    x=None, y=None, s=None, n=None, m=None, p=None,
-    haploid_genome_size=None, threads=None,
-    sensitive=False, D=None, N=None, max_kocc=None,
-    hic1=None, hic2=None, ul=None,
-    s_base=None, f_perturb=None, l_msjoin=None,
-    path_max=None, path_min=None, 
+    prefix="trial_assembly",
+    x=None,
+    y=None,
+    s=None,
+    n=None,
+    m=None,
+    p=None,
+    haploid_genome_size=None,
+    threads=None,
+    sensitive=False,
+    D=None,
+    N=None,
+    max_kocc=None,
+    hic1=None,
+    hic2=None,
+    ul=None,
+    s_base=None,
+    f_perturb=None,
+    l_msjoin=None,
+    path_max=None,
+    path_min=None,
     primary=False,
     default_only=False,
-    **extra_args
+    **extra_args,
 ):
     """
     Constructs the hifiasm command string based on given parameters.
@@ -36,15 +51,11 @@ def build_hifiasm_command(
     if None in [haploid_genome_size, threads]:
         raise ValueError("haploid_genome_size and threads must be provided.")
 
-    cmd = (
-        f"hifiasm -o {prefix} "
-        f"--hg-size {haploid_genome_size}m "
-        f"-t {threads} "
-    )
-    
+    cmd = f"hifiasm -o {prefix} --hg-size {haploid_genome_size}m -t {threads} "
+
     if primary:
         cmd += "--primary "
-        
+
     if default_only:
         return cmd.strip()
 
@@ -55,7 +66,7 @@ def build_hifiasm_command(
         cmd += f"--h1 {hic1} --h2 {hic2} "
         if s_base is not None:
             cmd += f"--s-base {s_base} "
-        if f_perturb is not None: 
+        if f_perturb is not None:
             cmd += f"--f-perturb {f_perturb} "
         if l_msjoin is not None:
             cmd += f"--l-msjoin {l_msjoin} "
@@ -74,33 +85,42 @@ def build_hifiasm_command(
     return cmd.strip()
 
 
-def run_default_hifiasm_assembly(prefix, haploid_genome_size, threads, primary=False,
-                                  hic1=None, hic2=None, ul=None, input_reads=None):
+def run_default_hifiasm_assembly(
+    prefix,
+    haploid_genome_size,
+    threads,
+    primary=False,
+    hic1=None,
+    hic2=None,
+    ul=None,
+    input_reads=None,
+):
     """
     Run a clean hifiasm assembly with default parameters only.
     """
     try:
-        command = build_hifiasm_command(
-            prefix=prefix,
-            haploid_genome_size=haploid_genome_size,
-            threads=threads,
-            primary=primary,
-            hic1=hic1,
-            hic2=hic2,
-            ul=ul,
-            default_only=True
-        ) + f" {input_reads}"
+        command = (
+            build_hifiasm_command(
+                prefix=prefix,
+                haploid_genome_size=haploid_genome_size,
+                threads=threads,
+                primary=primary,
+                hic1=hic1,
+                hic2=hic2,
+                ul=ul,
+                default_only=True,
+            )
+            + f" {input_reads}"
+        )
     except ValueError as e:
         logger.error(f"Failed to build default command: {e}")
         exit(1)
 
     logger.info(f"Running clean hifiasm assembly with parameters:\n{command}")
-    
+
     try:
         return_code, log_path = loggerClass.run_command_with_logging(
-            command=command,
-            log_filename="hifiasm.log",
-            command_name="hifiasm"
+            command=command, log_filename="hifiasm.log", command_name="hifiasm"
         )
     except RuntimeError as e:
         logger.error(str(e))
@@ -109,5 +129,7 @@ def run_default_hifiasm_assembly(prefix, haploid_genome_size, threads, primary=F
     if return_code == 0:
         logger.info("Clean hifiasm run completed successfully")
     else:
-        logger.error(f"Default run failed with code: {return_code}. Check log at {log_path}")
+        logger.error(
+            f"Default run failed with code: {return_code}. Check log at {log_path}"
+        )
         exit(1)

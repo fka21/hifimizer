@@ -1,3 +1,2 @@
-SRR10971019_subsamples.fq.gz filter=lfs diff=lfs merge=lfs -text
 hifimizer-offline.sif filter=lfs diff=lfs merge=lfs -text
 hifimizer-online.sif filter=lfs diff=lfs merge=lfs -text

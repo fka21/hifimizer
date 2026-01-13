@@ -1,0 +1,14 @@
+{
+  "num_contigs": -0.8,
+  "length_diff": -1,
+  "n50": 1,
+  "l50": -0.4,
+  "single_copy": 1,
+  "multi_copy": -0.7,
+  "fragmented": -0.7,
+  "missing": -1,
+  "reads_mapped": 0.8,
+  "avg_length": 0.8,
+  "error_rate": -1,
+  "num_sv": -0.5
+}

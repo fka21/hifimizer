@@ -18,9 +18,9 @@ class AssemblyEvaluator:
     It integrates:
     - Assembly evaluation with `gfastats`
     - Read-to-assembly alignment and evaluation using `gfalign`
-    - Structural completeness scoring with `BUSCO`
+    - Completeness scoring with `BUSCO`
 
-    The metrics gathered from these steps are parsed and scored with predefined weights to guide optimization routines 
+    The metrics gathered from these steps are parsed and scored with predefined weights to guide optimization routines
     (e.g., Optuna) in search of parameter configurations that produce the best assemblies.
 
     Attributes:
@@ -32,7 +32,16 @@ class AssemblyEvaluator:
         db_uri (str): Full SQLite URI to the study database.
         threads (int): Number of threads to use in BUSCO and gfalign.
     """
-    def __init__(self, known_genome_size, input_reads, trial_id=None, threads=None, download_path=None):
+
+    def __init__(
+        self,
+        known_genome_size,
+        input_reads,
+        trial_id=None,
+        threads=None,
+        download_path=None,
+        logs_dir=None,
+    ):
         self.known_genome_size = known_genome_size
         self.input_reads = input_reads
         self.number_reads = 1000
@@ -44,34 +53,43 @@ class AssemblyEvaluator:
         self.threads = threads
         self.download_path = download_path
         self._compile_patterns()
-        
-        # Initialize subprocess logger
-        self.subprocess_logger = SubprocessLogger()
-        
+
+        # Initialize subprocess logger with provided logs_dir
+        self.subprocess_logger = SubprocessLogger(
+            logs_dir=logs_dir if logs_dir else Path.cwd() / "logs"
+        )
+
         # Initialize main logger for this evaluator
-        self.logger = logging.getLogger(f'AssemblyEval_{trial_id or "main"}')
+        self.logger = logging.getLogger(f"AssemblyEval_{trial_id or 'main'}")
 
         # Compile regex patterns for parsing outputs
         self._compile_patterns()
+        # Load metric weights from config (or use defaults)
+        self.weights = self._load_weights()
 
-    
     def _compile_patterns(self):
         """
         Pre-compile regular expression patterns for parsing output of evaluation tools.
         """
         self.gfastats_patterns = {
-            'num_contigs': re.compile(r'# contigs:\s+(\d+)'),
-            'length_diff': re.compile(r'Total contig length:\s+(\d+)'),
-            'n50': re.compile(r'Contig N50:\s+(\d+)'),
-            'l50': re.compile(r'Contig L50:\s+(\d+)'),
+            "num_contigs": re.compile(r"# contigs:\s+(\d+)"),
+            "length_diff": re.compile(r"Total contig length:\s+(\d+)"),
+            "n50": re.compile(r"Contig N50:\s+(\d+)"),
+            "l50": re.compile(r"Contig L50:\s+(\d+)"),
         }
-        
+
         self.stats_patterns = {
-            'reads_mapped': re.compile(r'reads mapped:\s+(\d+)'),
-            'bases_mapped': re.compile(r'bases mapped \(cigar\):\s+(\d+)'),
-            'error_rate': re.compile(r'error rate:\s+([0-9]+\.?[0-9]*([eE][-+]?[0-9]+)?)')
+            "reads_mapped": re.compile(r"reads mapped:\s+(\d+)"),
+            "bases_mapped": re.compile(r"bases mapped \(cigar\):\s+(\d+)"),
+            "error_rate": re.compile(
+                r"error rate:\s+([0-9]+\.?[0-9]*([eE][-+]?[0-9]+)?)"
+            ),
         }
-    
+
+        self.sniffles_patterns = {
+            "num_sv": re.compile(r"Total SVs:\s+(\d+)"),
+        }
+
     @staticmethod
     def run_command(self, command, command_name="command"):
         """
@@ -82,23 +100,24 @@ class AssemblyEvaluator:
                 command=command,
                 log_filename=f"{command_name}.log",
                 command_name=command_name,
-                trial_id=self.trial_id
+                trial_id=self.trial_id,
             )
-            
+
             if return_code != 0:
-                self.logger.error(f"{command_name} failed (return code: {return_code}). See log: {log_path}")
+                self.logger.error(
+                    f"{command_name} failed (return code: {return_code}). See log: {log_path}"
+                )
                 raise RuntimeError(f"{command_name} failed - see {log_path}")
-            
+
             # For compatibility, return stdout from log file
-            with open(log_path, 'r') as f:
+            with open(log_path, "r") as f:
                 content = f.read()
-            
+
             return content, "", return_code
-            
+
         except Exception as e:
             self.logger.error(f"Command execution failed: {e}")
             raise
-
 
     def download_busco(self, lineage="metazoa_odb12"):
         """
@@ -113,7 +132,9 @@ class AssemblyEvaluator:
             return
         try:
             command = f"busco --download {lineage}"
-            return self.run_command(self, command = command, command_name="busco_download")
+            return self.run_command(
+                self, command=command, command_name="busco_download"
+            )
         except Exception as e:
             self.logger.error(f"BUSCO download failed: {e}")
             raise
@@ -136,7 +157,7 @@ class AssemblyEvaluator:
             self.logger.error("Gfastats analysis failed")
             raise
 
-    def read_subsetting(self, num_reads = None):
+    def read_subsetting(self, num_reads=None):
         """
         Subsample reads from the input FASTA/FASTQ file and write to subset_reads.
 
@@ -149,30 +170,32 @@ class AssemblyEvaluator:
             num_reads = self.number_reads
 
         # Determine file format
-        if fname.endswith(('.fastq', '.fq', '.fastq.gz', '.fq.gz')):
-            fmt = 'fastq'
-        elif fname.endswith(('.fasta', '.fa', '.fasta.gz', '.fa.gz')):
-            fmt = 'fasta'
+        if fname.endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz")):
+            fmt = "fastq"
+        elif fname.endswith((".fasta", ".fa", ".fasta.gz", ".fa.gz")):
+            fmt = "fasta"
         else:
-            raise ValueError(f"Input file {fname} is not in a recognized FASTA or FASTQ format.")
+            raise ValueError(
+                f"Input file {fname} is not in a recognized FASTA or FASTQ format."
+            )
 
-        open_func = gzip.open if fname.endswith('.gz') else open
+        open_func = gzip.open if fname.endswith(".gz") else open
 
         # Read and sample records
-        with open_func(self.input_reads, 'rt') as handle:
+        with open_func(self.input_reads, "rt") as handle:
             records = list(SeqIO.parse(handle, fmt))
         sampled = random.sample(records, min(num_reads, len(records)))
 
         # Write sampled reads
-        output_is_gz = str(self.subset_reads).endswith('.gz')
+        output_is_gz = str(self.subset_reads).endswith(".gz")
         open_func_out = gzip.open if output_is_gz else open
 
-        with open_func_out(self.subset_reads, 'wt') as out_handle:
+        with open_func_out(self.subset_reads, "wt") as out_handle:
             SeqIO.write(sampled, out_handle, fmt)
 
     @staticmethod
     def convert_gfa_to_fasta(gfa_file, output_fasta):
-        """ 
+        """
         Convert GFA file to FASTA format.
 
         Args:
@@ -182,12 +205,14 @@ class AssemblyEvaluator:
         Returns:
             _type_: _description_
         """
-        command = ["awk", "$1 == \"S\" {print \">\"$2\"\\n\"$3}", gfa_file]
-        with open(output_fasta, 'w') as out_file:
+        command = ["awk", '$1 == "S" {print ">"$2"\\n"$3}', gfa_file]
+        with open(output_fasta, "w") as out_file:
             subprocess.run(command, stdout=out_file, check=True)
         return True
 
-    def run_busco(self, fasta_file, lineage="metazoa_odb12", mode="genome", download_path=None):
+    def run_busco(
+        self, fasta_file, lineage="metazoa_odb12", mode="genome", download_path=None
+    ):
         """
         Run BUSCO on the given FASTA assembly.
 
@@ -204,21 +229,31 @@ class AssemblyEvaluator:
 
         command = (
             f"busco -i {fasta_file} -l {lineage} -m {mode} -o {output_dir} "
-            f"-c {self.threads} --metaeuk --skip_bbtools --force --offline"
+            f"-c {self.threads} --metaeuk --skip_bbtools --force"
         )
         if download_path:
             command += f" --download_path {download_path}"
 
         try:
             self.run_command(self, command, "busco")
-            busco_json_file = (
-                f"{output_dir}/short_summary.specific.{lineage}.busco_output_trial_assembly.json"
-            )
+            # Locate the BUSCO short summary JSON file produced in the output directory.
+            out_dir_path = Path(output_dir)
+            # BUSCO may include different suffixes in the short_summary filename
+            # depending on the provided -o value; use a glob to find the JSON.
+            json_pattern = f"short_summary.specific.{lineage}.*.json"
+            matches = list(out_dir_path.glob(json_pattern))
+            if not matches:
+                # fallback to a more generic pattern
+                matches = list(out_dir_path.glob("short_summary.*.json"))
+            if not matches:
+                raise FileNotFoundError(
+                    f"BUSCO summary JSON not found in {output_dir} (pattern {json_pattern})"
+                )
+            busco_json_file = str(matches[0])
             return self.parse_busco_results(busco_json_file)
         except RuntimeError:
             self.logger.error("BUSCO evaluation failed")
             raise
-
 
     def parse_gfastats_output(self, output):
         """
@@ -228,21 +263,23 @@ class AssemblyEvaluator:
             output (str): Raw gfastats stdout output.
 
         Returns:
-            dict: Dictionary of log-transformed gfastats metrics.
+            dict: Dictionary of raw gfastats metrics.
         """
         metrics = {}
         for key, pattern in self.gfastats_patterns.items():
             match = re.search(pattern, output)
             if match:
                 value = int(match.group(1))
-                if key == 'length_diff':
-                    metrics[key] = np.log10(abs(value - self.known_genome_size) / 1_000_000) # Convert to Mbp
-                elif key == 'n50':
-                    metrics[key] = np.log10(value / 1_000_000)  # Convert to Mbp
+                if key == "length_diff":
+                    # Return raw difference in megabases
+                    metrics[key] = abs(value - self.known_genome_size) / 1_000_000
+                elif key == "n50":
+                    # Return raw N50 value
+                    metrics[key] = value
                 else:
-                    metrics[key] = np.log10(value)
+                    # Return raw value
+                    metrics[key] = value
         return metrics
-
 
     def run_minimap2_align(self, fasta_file, reads_file, sam_file, threads=None):
         """
@@ -259,7 +296,7 @@ class AssemblyEvaluator:
         """
         threads = threads or self.threads
         command = f"minimap2 -t {threads} -ax map-hifi -o {sam_file} {fasta_file} {reads_file}"
-        
+
         try:
             self.run_command(self, command, "minimap2")
             return sam_file
@@ -267,6 +304,76 @@ class AssemblyEvaluator:
             self.logger.error("Minimap2 alignment failed")
             raise
 
+    def convert_sam_to_bam(self, sam_file, bam_file=None, threads=None):
+        """
+        Convert SAM file to BAM format and sort it.
+
+        Args:
+            sam_file (str): Path to the input SAM file.
+            bam_file (str, optional): Output BAM file. Defaults to input with .bam extension.
+            threads (int, optional): Number of CPU threads. If not provided, use self.threads.
+
+        Returns:
+            str: Path to the output BAM file.
+        """
+        threads = threads or self.threads
+        if bam_file is None:
+            bam_file = sam_file.replace(".sam", ".bam")
+
+        # Convert SAM to BAM
+        command = f"samtools view -b -h -o {bam_file} {sam_file}"
+        try:
+            self.run_command(self, command, "samtools_view")
+        except RuntimeError:
+            self.logger.error("SAM to BAM conversion failed")
+            raise
+
+        return bam_file
+
+    def sort_bam(self, bam_file, sorted_bam_file=None, threads=None):
+        """
+        Sort a BAM file.
+
+        Args:
+            bam_file (str): Path to the input BAM file.
+            sorted_bam_file (str, optional): Output sorted BAM file. Defaults to input with .sorted.bam.
+            threads (int, optional): Number of CPU threads. If not provided, use self.threads.
+
+        Returns:
+            str: Path to the sorted BAM file.
+        """
+        threads = threads or self.threads
+        if sorted_bam_file is None:
+            sorted_bam_file = bam_file.replace(".bam", ".sorted.bam")
+
+        command = f"samtools sort -@ {threads} -o {sorted_bam_file} {bam_file}"
+        try:
+            self.run_command(self, command, "samtools_sort")
+        except RuntimeError:
+            self.logger.error("BAM sorting failed")
+            raise
+
+        return sorted_bam_file
+
+    def index_bam(self, bam_file):
+        """
+        Index a sorted BAM file to create a .bai file.
+
+        Args:
+            bam_file (str): Path to the sorted BAM file.
+
+        Returns:
+            str: Path to the BAM index file.
+        """
+        bam_index_file = f"{bam_file}.bai"
+        command = f"samtools index {bam_file}"
+        try:
+            self.run_command(self, command, "samtools_index")
+        except RuntimeError:
+            self.logger.error("BAM indexing failed")
+            raise
+
+        return bam_index_file
 
     def parse_samtools_stats(self, sam_file):
         """
@@ -275,8 +382,8 @@ class AssemblyEvaluator:
         Args:
             sam_file (str): Path to the aligned SAM file.
 
-        Prints:
-            avg_alignment_length, avg_mapping_quality
+        Returns:
+            dict: Dictionary of raw alignment statistics.
         """
         command = f"samtools stats {sam_file}"
         stdout, _, _ = self.run_command(self, command, "samtools_stats")
@@ -286,24 +393,84 @@ class AssemblyEvaluator:
             match = pattern.search(stdout)
             if match:
                 try:
-                    if key == 'bases_mapped':
-                        # Convert to float for average length
-                        value = float(match.group(1))
-                        stats[key] = np.log10(value / 1_000_000) 
-                    else:
-                        value = float(match.group(1))
-                        stats[key] = np.log10(value + 1)
+                    value = float(match.group(1))
+                    # Return raw values
+                    stats[key] = value
                 except (ValueError, TypeError) as e:
                     self.logger.warning(f"Value conversion failed for {key}: {e}")
                     stats[key] = 0
             else:
                 self.logger.warning(f"Pattern not found for {key} in samtools output")
                 stats[key] = 0
-        
+
         return stats
 
+    def run_sniffles2(self, bam_file, vcf_file=None):
+        """
+        Run sniffles2 on the sorted BAM file to detect structural variants.
 
-    
+        Args:
+            bam_file (str): Path to the sorted BAM file.
+            vcf_file (str, optional): Output VCF file. Defaults to sniffles_output.vcf.
+
+        Returns:
+            dict: Parsed sniffles2 metrics.
+        """
+        if vcf_file is None:
+            # Use trial ID if available for unique filenames
+            trial_suffix = (
+                f"trial_{self.trial_id}" if self.trial_id is not None else "default"
+            )
+            vcf_file = f"sniffles_output_{trial_suffix}.vcf"
+
+        command = f"sniffles -i {bam_file} -v {vcf_file} --allow-overwrite"
+
+        try:
+            self.run_command(self, command, "sniffles2")
+            return self.parse_sniffles_vcf(vcf_file)
+        except RuntimeError:
+            self.logger.error("Sniffles2 analysis failed")
+            raise
+
+    def parse_sniffles_vcf(self, vcf_file):
+        """
+        Parse sniffles2 VCF output to extract structural variant metrics.
+
+        Args:
+            vcf_file (str): Path to sniffles VCF file.
+
+        Returns:
+            dict: Dictionary of raw sniffles metrics.
+        """
+        metrics = {
+            "num_sv": 0,
+        }
+
+        try:
+            if not os.path.exists(vcf_file):
+                self.logger.warning(f"Sniffles VCF file not found: {vcf_file}")
+                return metrics
+
+            with open(vcf_file, "r") as f:
+                sv_count = 0
+                for line in f:
+                    # Skip header lines (start with # or ##)
+                    if line.startswith("#"):
+                        continue
+                    # Count non-empty lines that aren't comments
+                    if line.strip():
+                        sv_count += 1
+
+                # Return raw count
+                metrics["num_sv"] = sv_count
+                self.logger.debug(f"Detected {sv_count} structural variants")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to parse sniffles VCF {vcf_file}: {e}")
+            metrics["num_sv"] = 0
+
+        return metrics
+
     @staticmethod
     def parse_busco_results(busco_json_file):
         """
@@ -313,23 +480,77 @@ class AssemblyEvaluator:
             busco_json_file (str): Path to BUSCO JSON summary.
 
         Returns:
-            dict: Dictionary of log-transformed BUSCO metrics.
+            dict: Dictionary of raw BUSCO metrics.
         """
         with open(busco_json_file, "r") as f:
             data = json.load(f)
 
         metrics = {
-            "single_copy": np.log10(data["results"]["Single copy BUSCOs"] + 1),
-            "multi_copy": np.log10(data["results"]["Multi copy BUSCOs"] + 1),
-            "fragmented": np.log10(data["results"]["Fragmented BUSCOs"] + 1),
-            "missing": np.log10(data["results"]["Missing BUSCOs"] + 1),
+            "single_copy": data["results"]["Single copy BUSCOs"],
+            "multi_copy": data["results"]["Multi copy BUSCOs"],
+            "fragmented": data["results"]["Fragmented BUSCOs"],
+            "missing": data["results"]["Missing BUSCOs"],
         }
         return metrics
 
-    @staticmethod
-    def calculate_weighted_sum(metrics):
+    def _load_weights(self):
+        """Load metric weights from a JSON config file, falling back to defaults.
+
+        Search order:
+        - ./weights.json (current working dir)
+        - repository root weights.json (two levels up from this file)
         """
-        Calculate weighted sum of metrics based on predefined importance.
+        default_weights = {
+            "num_contigs": -0.8,
+            "length_diff": -1,
+            "n50": 1,
+            "l50": -0.4,
+            "single_copy": 1,
+            "multi_copy": -0.7,
+            "fragmented": -0.7,
+            "missing": -1,
+            "reads_mapped": 0.8,
+            "bases_mapped": 0.8,
+            "error_rate": -1,
+            "num_sv": -0.5,
+        }
+
+        # Candidate locations for user-editable config
+        candidates = [
+            Path.cwd() / "weights.json",
+            Path(__file__).resolve().parents[2] / "weights.json",
+        ]
+
+        for p in candidates:
+            try:
+                if p.exists():
+                    with open(p, "r") as fh:
+                        loaded = json.load(fh)
+                    # Validate and coerce numeric values
+                    validated = {}
+                    for k, v in default_weights.items():
+                        if k in loaded:
+                            try:
+                                validated[k] = float(loaded[k])
+                            except Exception:
+                                logging.getLogger("AssemblyEval").warning(
+                                    f"Invalid weight for {k} in {p}; using default"
+                                )
+                                validated[k] = v
+                        else:
+                            validated[k] = v
+                    return validated
+            except Exception as e:
+                logging.getLogger("AssemblyEval").warning(
+                    f"Failed to load weights from {p}: {e}"
+                )
+
+        return default_weights
+        return default_weights
+
+    def calculate_weighted_sum(self, metrics):
+        """
+        Calculate weighted sum of metrics using loaded weights.
 
         Args:
             metrics (dict): Dictionary of metric scores.
@@ -337,22 +558,19 @@ class AssemblyEvaluator:
         Returns:
             float: Weighted sum.
         """
-        weights = {
-            'num_contigs': -0.8,
-            'length_diff': -1,
-            'n50': 1,
-            'l50': -0.4,
-            'single_copy': 1,
-            'multi_copy': -0.7,
-            'fragmented': -0.7,
-            'missing': -1,
-            'reads_mapped': 0.8,
-            'avg_length': 0.8,
-            'error_rate': -1,
-        }
-        return sum(metrics[key] * weights[key] for key in weights if key in metrics)
-    
-    def evaluate_assembly(self, gfa_file, fasta_file, include_busco=True, busco_lineage="metazoa_odb12", download_path=None):
+        # Weighted-sum scoring removed — multicriteria optimization only.
+        raise RuntimeError(
+            "Weighted-sum scoring is disabled; use multicriteria optimization."
+        )
+
+    def evaluate_assembly(
+        self,
+        gfa_file,
+        fasta_file,
+        include_busco=True,
+        busco_lineage="metazoa_odb12",
+        download_path=None,
+    ):
         """
         Perform a full evaluation pipeline for a given assembly.
 
@@ -366,42 +584,105 @@ class AssemblyEvaluator:
         """
         if not Path(gfa_file).exists():
             raise FileNotFoundError(f"GFA file not found: {gfa_file}")
-            
+
         try:
             # Stage 1: GFA to FASTA conversion
             self.logger.info("Converting GFA to FASTA")
             self.convert_gfa_to_fasta(gfa_file, fasta_file)
-            
+
             # Stage 2: Read alignment
             self.logger.info("Running minimap2 alignment")
-            aln_file = self.run_minimap2_align(fasta_file, self.subset_reads, self.aln_file, threads=self.threads)
-            
+            aln_file = self.run_minimap2_align(
+                fasta_file, self.subset_reads, self.aln_file, threads=self.threads
+            )
+
             # Stage 3: Parse alignment stats
             self.logger.info("Parsing alignment statistics")
             metrics_minimap2 = self.parse_samtools_stats(aln_file)
-            
-            # Stage 4: Assembly statistics
+
+            # Stage 4: Convert SAM to sorted BAM for sniffles2
+            self.logger.info("Converting SAM to sorted BAM and indexing")
+            bam_file = self.convert_sam_to_bam(aln_file)
+            sorted_bam_file = self.sort_bam(bam_file)
+            self.index_bam(sorted_bam_file)
+
+            # Stage 5: Assembly statistics
             self.logger.info("Running gfastats")
             metrics_gfastats = self.run_gfastats(gfa_file)
-            
+
             combined_metrics = {**metrics_gfastats, **metrics_minimap2}
-            
-            # Stage 5: BUSCO evaluation (optional)
+
+            # Stage 6: Structural variant detection with sniffles2
+            self.logger.info("Running sniffles2 for structural variant detection")
+            metrics_sniffles = self.run_sniffles2(sorted_bam_file)
+            combined_metrics.update(metrics_sniffles)
+
+            # Stage 7: BUSCO evaluation (optional)
             if include_busco:
                 self.logger.info("Running BUSCO evaluation")
-                metrics_busco = self.run_busco(fasta_file, lineage=busco_lineage, download_path=self.download_path)
+                metrics_busco = self.run_busco(
+                    fasta_file, lineage=busco_lineage, download_path=self.download_path
+                )
                 combined_metrics.update(metrics_busco)
-            
-            # Stage 6: Final scoring
-            self.logger.info("Calculating weighted score")
-            weighted_sum = self.calculate_weighted_sum(combined_metrics)
-            
-            return weighted_sum
-            
+
+            # Return raw metrics dict for multicriteria optimization
+            return combined_metrics
+
         except Exception as e:
             stage_info = self._get_current_stage(e)
             self.logger.error(f"Assembly evaluation failed at stage: {stage_info}")
-            
+
+    def cleanup_intermediate_files(self, trial_id=None):
+        """
+        Clean up intermediate files generated during assembly evaluation.
+        Removes SAM, unsorted BAM files, and other temporary files.
+
+        Args:
+            trial_id (int, optional): Trial ID for prefix matching.
+        """
+        try:
+            import glob
+
+            # List of patterns for intermediate files to remove
+            patterns_to_remove = [
+                "*.sam",  # SAM alignment files
+                "*.bam",  # Unsorted BAM files (keep only sorted)
+                "subset_reads.*",  # Subsetted reads (can be regenerated)
+                "sniffles_output_*.vcf",  # Trial-specific sniffles VCF files
+                "busco_output_trial_assembly/*",  # Trial BUSCO outputs
+            ]
+
+            removed_count = 0
+            for pattern in patterns_to_remove:
+                for filepath in glob.glob(pattern):
+                    try:
+                        # Don't remove sorted BAM files
+                        if filepath.endswith(".sorted.bam") or filepath.endswith(
+                            ".sorted.bam.bai"
+                        ):
+                            continue
+
+                        if os.path.isfile(filepath):
+                            os.remove(filepath)
+                            removed_count += 1
+                            self.logger.debug(f"Removed intermediate file: {filepath}")
+                        elif os.path.isdir(filepath):
+                            import shutil
+
+                            shutil.rmtree(filepath)
+                            removed_count += 1
+                            self.logger.debug(
+                                f"Removed intermediate directory: {filepath}"
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to remove {filepath}: {e}")
+
+            if removed_count > 0:
+                self.logger.info(f"Cleaned up {removed_count} intermediate files")
+
+        except Exception as e:
+            self.logger.warning(f"Cleanup failed: {e}")
+
     def _get_current_stage(self, error):
         """Determine which stage failed based on error type/message."""
         error_str = str(error).lower()
@@ -413,19 +694,9 @@ class AssemblyEvaluator:
             return "Alignment statistics parsing"
         elif "gfastats" in error_str:
             return "Assembly statistics"
+        elif "sniffles" in error_str or "sv" in error_str:
+            return "Structural variant detection"
         elif "busco" in error_str:
             return "BUSCO evaluation"
         else:
             return "Unknown stage"
-
-
-
-
-async def setup(num_reads, lineage):
-    """
-    Setup function to initialize the AssemblyEvaluator and run the evaluation pipeline.
-    """
-    # Ensure BUSCO dataset is downloaded before running optimization
-    await evaluator.download_busco_metazoa_odb10(lineage)
-    # Subset reads for gfalign
-    await evaluator.run_read_subsetting(num_reads = num_reads)
