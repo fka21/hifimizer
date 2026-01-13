@@ -1,47 +1,80 @@
 # Hifimizer
 
-This repository contains my attempt on trying to improve genome assembler pipelines. The idea revolves around using Bayesian optimization framework from [optuna](https://optuna.readthedocs.io/en/stable/) to try to find the best assembly parameter space in [hifiasm](https://hifiasm.readthedocs.io/en/latest/).
+**Hifimizer** is a framework for optimizing *HiFi genome assembly* parameters using Bayesian optimization.
+It wraps **hifiasm** in an automated optimization loop powered by **Optuna**, enabling systematic exploration
+of the assembly parameter space instead of manual trial-and-error.
 
-## Prerequisites
+The primary goal is to identify parameter configurations that maximize assembly quality metrics
+(e.g. contiguity, BUSCO completeness) for a given dataset.
 
-There are 3 options for using this tool. 
+---
 
-1.  Use the `src/hifimizer.py` directly. For this please setup a [conda](https://bioconda.github.io) environemnt using the `environment.yml` file. 
-2.  Use the `Dockerfile` provided to build your own Docker image.
-3.  Use the `Singularity.def` to build a singularity image.
+## Core idea
 
-> **NOTE**
->  
-> For the Singularity option there are two `.sif` files. One of them, `hifimizer-online.sif` is able to download [busco](https://busco.ezlab.org) database online. The other one, `hifimizer-offline.sif` is set up to work offline. Therefore [busco](https://busco.ezlab.org) database needs to be downloaded *a priori* for usage.
+Genome assemblers expose dozens of parameters, many of which interact non-linearly.
+Hifimizer treats assembly as an optimization problem:
 
-## Usage 
+- parameter space → hifiasm arguments
+- objective function → assembly quality metrics
+- optimizer → Bayesian optimization (Optuna)
 
-### Manual
-Please use the manual of the tool to navigate the possible options.
+This allows reproducible, data-driven tuning of assembly pipelines.
+
+---
+
+## Installation options
+
+You can run Hifimizer in three supported ways.
+
+### Option 1: Conda (native execution)
+
+Create the environment:
+
+```bash
+conda env create -f environment.yml
+conda activate hifimizer
 ```
-# If using the first installation option please use:
-src/hifimizer.py -h
 
-# If using Docker please use:
-docker run -v [path-to-this-repository]:/opt/project fka21/hifimizer:1.0.5 src/hifimizer.py -h
+Run
+```bash
+python3 src/hifimizer.py -h
+```
+### Option 2: Docker
 
-# If using Singularity please use:
-apptainer exec --bind [path-to-this-repository]:/opt/project hifimizer-online.sif src/hifimizer.py -h
+Pull the prebuilt image:
+
+```bash
+docker pull fka21/hifimizer:latest
 ```
 
-### Example
+Run:
 
-Toy reads are provided to test the tool. Please use the following command to test it.
+```bash
+docker run --rm \
+  -v $(pwd):/opt/project \
+  fka21/hifimizer:latest \
+  src/hifimizer.py -h
+```
 
+### Option 3: Singularity (for HPC environments)
+
+Two images are provided:
+
+* `hifimizer-online.sif` - Downloads BUSCO databases at runtime.
+* `hifimizer-offline.sif` - Requires BUSCO databases to be downloaded in advance.
+
+Example:
+
+```bash
+apptainer exec \
+  --bind $(pwd):/opt/project \
+  hifimizer-online.sif \
+  src/hifimizer.py -h
 ```
-# Run this minimal example
-nohup docker run \
-    -v [path-to-this-repository]:/opt/project \
-    fka21/hifimizer:1.0.5 \
-    src/hifimizer.py \
-    --input-reads example/SRR10971019_subseq.fastq.gz \
-    --genome-size 5 \
-    --busco-lineage enterobacterales_odb10 \
-    --threads 20 \
-    --num-trials 25 > hifimizer.log 2>&1 &
-```
+
+## Requirements
+* HiFi (PacBio CCS) reads
+* Genome size estimate
+* hifiasm
+* Sufficient compute for repeated assemblies
+* Patience...
