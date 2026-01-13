@@ -40,6 +40,7 @@ class AssemblyEvaluator:
         trial_id=None,
         threads=None,
         download_path=None,
+        logs_dir=None,
     ):
         self.known_genome_size = known_genome_size
         self.input_reads = input_reads
@@ -53,8 +54,10 @@ class AssemblyEvaluator:
         self.download_path = download_path
         self._compile_patterns()
 
-        # Initialize subprocess logger
-        self.subprocess_logger = SubprocessLogger()
+        # Initialize subprocess logger with provided logs_dir
+        self.subprocess_logger = SubprocessLogger(
+            logs_dir=logs_dir if logs_dir else Path.cwd() / "logs"
+        )
 
         # Initialize main logger for this evaluator
         self.logger = logging.getLogger(f"AssemblyEval_{trial_id or 'main'}")
@@ -260,7 +263,7 @@ class AssemblyEvaluator:
             output (str): Raw gfastats stdout output.
 
         Returns:
-            dict: Dictionary of log-transformed gfastats metrics.
+            dict: Dictionary of raw gfastats metrics.
         """
         metrics = {}
         for key, pattern in self.gfastats_patterns.items():
@@ -268,13 +271,14 @@ class AssemblyEvaluator:
             if match:
                 value = int(match.group(1))
                 if key == "length_diff":
-                    metrics[key] = np.log10(
-                        abs(value - self.known_genome_size) / 1_000_000
-                    )  # Convert to Mbp
+                    # Return raw difference in megabases
+                    metrics[key] = abs(value - self.known_genome_size) / 1_000_000
                 elif key == "n50":
-                    metrics[key] = np.log10(value / 1_000_000)  # Convert to Mbp
+                    # Return raw N50 value
+                    metrics[key] = value
                 else:
-                    metrics[key] = np.log10(value)
+                    # Return raw value
+                    metrics[key] = value
         return metrics
 
     def run_minimap2_align(self, fasta_file, reads_file, sam_file, threads=None):
@@ -300,6 +304,77 @@ class AssemblyEvaluator:
             self.logger.error("Minimap2 alignment failed")
             raise
 
+    def convert_sam_to_bam(self, sam_file, bam_file=None, threads=None):
+        """
+        Convert SAM file to BAM format and sort it.
+
+        Args:
+            sam_file (str): Path to the input SAM file.
+            bam_file (str, optional): Output BAM file. Defaults to input with .bam extension.
+            threads (int, optional): Number of CPU threads. If not provided, use self.threads.
+
+        Returns:
+            str: Path to the output BAM file.
+        """
+        threads = threads or self.threads
+        if bam_file is None:
+            bam_file = sam_file.replace(".sam", ".bam")
+
+        # Convert SAM to BAM
+        command = f"samtools view -b -h -o {bam_file} {sam_file}"
+        try:
+            self.run_command(self, command, "samtools_view")
+        except RuntimeError:
+            self.logger.error("SAM to BAM conversion failed")
+            raise
+
+        return bam_file
+
+    def sort_bam(self, bam_file, sorted_bam_file=None, threads=None):
+        """
+        Sort a BAM file.
+
+        Args:
+            bam_file (str): Path to the input BAM file.
+            sorted_bam_file (str, optional): Output sorted BAM file. Defaults to input with .sorted.bam.
+            threads (int, optional): Number of CPU threads. If not provided, use self.threads.
+
+        Returns:
+            str: Path to the sorted BAM file.
+        """
+        threads = threads or self.threads
+        if sorted_bam_file is None:
+            sorted_bam_file = bam_file.replace(".bam", ".sorted.bam")
+
+        command = f"samtools sort -@ {threads} -o {sorted_bam_file} {bam_file}"
+        try:
+            self.run_command(self, command, "samtools_sort")
+        except RuntimeError:
+            self.logger.error("BAM sorting failed")
+            raise
+
+        return sorted_bam_file
+
+    def index_bam(self, bam_file):
+        """
+        Index a sorted BAM file to create a .bai file.
+
+        Args:
+            bam_file (str): Path to the sorted BAM file.
+
+        Returns:
+            str: Path to the BAM index file.
+        """
+        bam_index_file = f"{bam_file}.bai"
+        command = f"samtools index {bam_file}"
+        try:
+            self.run_command(self, command, "samtools_index")
+        except RuntimeError:
+            self.logger.error("BAM indexing failed")
+            raise
+
+        return bam_index_file
+
     def parse_samtools_stats(self, sam_file):
         """
         Parse samtools stats output to extract average alignment length and mapping quality.
@@ -307,8 +382,8 @@ class AssemblyEvaluator:
         Args:
             sam_file (str): Path to the aligned SAM file.
 
-        Prints:
-            avg_alignment_length, avg_mapping_quality
+        Returns:
+            dict: Dictionary of raw alignment statistics.
         """
         command = f"samtools stats {sam_file}"
         stdout, _, _ = self.run_command(self, command, "samtools_stats")
@@ -318,13 +393,9 @@ class AssemblyEvaluator:
             match = pattern.search(stdout)
             if match:
                 try:
-                    if key == "bases_mapped":
-                        # Convert to float for average length
-                        value = float(match.group(1))
-                        stats[key] = np.log10(value / 1_000_000)
-                    else:
-                        value = float(match.group(1))
-                        stats[key] = np.log10(value + 1)
+                    value = float(match.group(1))
+                    # Return raw values
+                    stats[key] = value
                 except (ValueError, TypeError) as e:
                     self.logger.warning(f"Value conversion failed for {key}: {e}")
                     stats[key] = 0
@@ -334,21 +405,25 @@ class AssemblyEvaluator:
 
         return stats
 
-    def run_sniffles2(self, sam_file, vcf_file=None):
+    def run_sniffles2(self, bam_file, vcf_file=None):
         """
-        Run sniffles2 on the aligned SAM file to detect structural variants.
+        Run sniffles2 on the sorted BAM file to detect structural variants.
 
         Args:
-            sam_file (str): Path to the aligned SAM file.
+            bam_file (str): Path to the sorted BAM file.
             vcf_file (str, optional): Output VCF file. Defaults to sniffles_output.vcf.
 
         Returns:
             dict: Parsed sniffles2 metrics.
         """
         if vcf_file is None:
-            vcf_file = "sniffles_output.vcf"
+            # Use trial ID if available for unique filenames
+            trial_suffix = (
+                f"trial_{self.trial_id}" if self.trial_id is not None else "default"
+            )
+            vcf_file = f"sniffles_output_{trial_suffix}.vcf"
 
-        command = f"sniffles -i {sam_file} -v {vcf_file}"
+        command = f"sniffles -i {bam_file} -v {vcf_file} --allow-overwrite"
 
         try:
             self.run_command(self, command, "sniffles2")
@@ -365,28 +440,33 @@ class AssemblyEvaluator:
             vcf_file (str): Path to sniffles VCF file.
 
         Returns:
-            dict: Dictionary of log-transformed sniffles metrics.
+            dict: Dictionary of raw sniffles metrics.
         """
         metrics = {
             "num_sv": 0,
         }
 
         try:
+            if not os.path.exists(vcf_file):
+                self.logger.warning(f"Sniffles VCF file not found: {vcf_file}")
+                return metrics
+
             with open(vcf_file, "r") as f:
                 sv_count = 0
                 for line in f:
+                    # Skip header lines (start with # or ##)
                     if line.startswith("#"):
                         continue
-                    sv_count += 1
-                
-                # Log-transform the count
-                metrics["num_sv"] = np.log10(sv_count + 1)
-                
-        except FileNotFoundError:
-            self.logger.warning(f"Sniffles VCF file not found: {vcf_file}")
-            metrics["num_sv"] = 0
+                    # Count non-empty lines that aren't comments
+                    if line.strip():
+                        sv_count += 1
+
+                # Return raw count
+                metrics["num_sv"] = sv_count
+                self.logger.debug(f"Detected {sv_count} structural variants")
+
         except Exception as e:
-            self.logger.warning(f"Failed to parse sniffles VCF: {e}")
+            self.logger.warning(f"Failed to parse sniffles VCF {vcf_file}: {e}")
             metrics["num_sv"] = 0
 
         return metrics
@@ -400,16 +480,16 @@ class AssemblyEvaluator:
             busco_json_file (str): Path to BUSCO JSON summary.
 
         Returns:
-            dict: Dictionary of log-transformed BUSCO metrics.
+            dict: Dictionary of raw BUSCO metrics.
         """
         with open(busco_json_file, "r") as f:
             data = json.load(f)
 
         metrics = {
-            "single_copy": np.log10(data["results"]["Single copy BUSCOs"] + 1),
-            "multi_copy": np.log10(data["results"]["Multi copy BUSCOs"] + 1),
-            "fragmented": np.log10(data["results"]["Fragmented BUSCOs"] + 1),
-            "missing": np.log10(data["results"]["Missing BUSCOs"] + 1),
+            "single_copy": data["results"]["Single copy BUSCOs"],
+            "multi_copy": data["results"]["Multi copy BUSCOs"],
+            "fragmented": data["results"]["Fragmented BUSCOs"],
+            "missing": data["results"]["Missing BUSCOs"],
         }
         return metrics
 
@@ -520,18 +600,24 @@ class AssemblyEvaluator:
             self.logger.info("Parsing alignment statistics")
             metrics_minimap2 = self.parse_samtools_stats(aln_file)
 
-            # Stage 4: Assembly statistics
+            # Stage 4: Convert SAM to sorted BAM for sniffles2
+            self.logger.info("Converting SAM to sorted BAM and indexing")
+            bam_file = self.convert_sam_to_bam(aln_file)
+            sorted_bam_file = self.sort_bam(bam_file)
+            self.index_bam(sorted_bam_file)
+
+            # Stage 5: Assembly statistics
             self.logger.info("Running gfastats")
             metrics_gfastats = self.run_gfastats(gfa_file)
 
             combined_metrics = {**metrics_gfastats, **metrics_minimap2}
 
-            # Stage 5: Structural variant detection with sniffles2
+            # Stage 6: Structural variant detection with sniffles2
             self.logger.info("Running sniffles2 for structural variant detection")
-            metrics_sniffles = self.run_sniffles2(aln_file)
+            metrics_sniffles = self.run_sniffles2(sorted_bam_file)
             combined_metrics.update(metrics_sniffles)
 
-            # Stage 6: BUSCO evaluation (optional)
+            # Stage 7: BUSCO evaluation (optional)
             if include_busco:
                 self.logger.info("Running BUSCO evaluation")
                 metrics_busco = self.run_busco(
@@ -545,6 +631,57 @@ class AssemblyEvaluator:
         except Exception as e:
             stage_info = self._get_current_stage(e)
             self.logger.error(f"Assembly evaluation failed at stage: {stage_info}")
+
+    def cleanup_intermediate_files(self, trial_id=None):
+        """
+        Clean up intermediate files generated during assembly evaluation.
+        Removes SAM, unsorted BAM files, and other temporary files.
+
+        Args:
+            trial_id (int, optional): Trial ID for prefix matching.
+        """
+        try:
+            import glob
+
+            # List of patterns for intermediate files to remove
+            patterns_to_remove = [
+                "*.sam",  # SAM alignment files
+                "*.bam",  # Unsorted BAM files (keep only sorted)
+                "subset_reads.*",  # Subsetted reads (can be regenerated)
+                "sniffles_output_*.vcf",  # Trial-specific sniffles VCF files
+                "busco_output_trial_assembly/*",  # Trial BUSCO outputs
+            ]
+
+            removed_count = 0
+            for pattern in patterns_to_remove:
+                for filepath in glob.glob(pattern):
+                    try:
+                        # Don't remove sorted BAM files
+                        if filepath.endswith(".sorted.bam") or filepath.endswith(
+                            ".sorted.bam.bai"
+                        ):
+                            continue
+
+                        if os.path.isfile(filepath):
+                            os.remove(filepath)
+                            removed_count += 1
+                            self.logger.debug(f"Removed intermediate file: {filepath}")
+                        elif os.path.isdir(filepath):
+                            import shutil
+
+                            shutil.rmtree(filepath)
+                            removed_count += 1
+                            self.logger.debug(
+                                f"Removed intermediate directory: {filepath}"
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to remove {filepath}: {e}")
+
+            if removed_count > 0:
+                self.logger.info(f"Cleaned up {removed_count} intermediate files")
+
+        except Exception as e:
+            self.logger.warning(f"Cleanup failed: {e}")
 
     def _get_current_stage(self, error):
         """Determine which stage failed based on error type/message."""

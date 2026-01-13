@@ -9,5 +9,6 @@
   "missing": -1,
   "reads_mapped": 0.8,
   "avg_length": 0.8,
-  "error_rate": -1
+  "error_rate": -1,
+  "num_sv": -0.5
 }

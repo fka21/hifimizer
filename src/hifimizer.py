@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import subprocess, logging, sys, optuna, psutil, signal, os, numpy as np
+import random
 from pathlib import Path
 import optuna.visualization as vis
 import optunahub
@@ -47,6 +48,11 @@ tpe_acquisition_visualizer = module.TPEAcquisitionVisualizer()
 # Parse command line arguments
 args = get_args()
 
+# Set random seeds for reproducibility if specified
+if args.seed is not None:
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
 # Parse command line arguments
 input_reads = Path(args.input_reads).resolve()
 hic1 = Path(args.hic1).resolve() if args.hic1 else None
@@ -55,12 +61,13 @@ ul = Path(args.ul).resolve() if args.ul else None
 threads = args.threads
 download_path = args.busco_download_path
 
-output_dir = Path(args.output_dir)
+# Convert output directory to absolute path to avoid confusion
+output_dir = Path(args.output_dir).resolve()
 output_dir.mkdir(parents=True, exist_ok=True)
 os.chdir(output_dir)
 
-# Create logs directory - using base_path to consolidate in single logs directory
-logs_dir = base_path / "logs"
+# Create logs directory inside output directory
+logs_dir = output_dir / "logs"
 logs_dir.mkdir(exist_ok=True, parents=True)
 
 # Configure logging
@@ -82,6 +89,7 @@ evaluator = AssemblyEvaluator(
     input_reads=input_reads,
     threads=threads,
     download_path=download_path,
+    logs_dir=logs_dir,
 )
 
 if args.default_hifiasm:
@@ -128,6 +136,7 @@ objective_builder = ObjectiveBuilder(
     include_busco=args.include_busco,
     busco_lineage=args.busco_lineage,
     download_path=download_path,
+    logs_dir=logs_dir,
 )
 # Build the objective function
 objective = objective_builder.build_objective()
@@ -231,7 +240,7 @@ try:
         directions=directions,
         storage=evaluator.db_uri,
         load_if_exists=load_if_exists,
-        sampler=optuna.samplers.TPESampler(),
+        sampler=optuna.samplers.TPESampler(seed=args.seed),
     )
 
     # Existing study handling: if not forcing rerun, continue from existing trials.
@@ -274,7 +283,7 @@ try:
             logging.info(
                 f"\n############################################\n"
                 f"\nBest trial by aggregate_score: {best_trial.number} score={best_score} params={best_trial.user_attrs.get('params', {})}\n"
-                f"\n############################################\n"
+                f"\n############################################"
             )
 
 except Exception as e:
@@ -287,41 +296,40 @@ except Exception as e:
 optuna_dir = Path("optuna_output")
 optuna_dir.mkdir(exist_ok=True, parents=True)
 
-# Save visualizations as interactive HTML files per metric (multi-objective requires a target)
-for metric in objective_builder.objectives:
+try:
+    vis.plot_param_importances(study, target=None).write_html(
+        optuna_dir / "optuna_param_importance.html"
+    )
+except Exception as e:
+    logging.warning(f"Failed to create param importance plot: {e}")
+
+# Save visualizations as interactive HTML files per metric (multi-objective requires a target lambda)
+for idx, metric in enumerate(objective_builder.objectives):
     try:
         metric_dir = optuna_dir / metric
         metric_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            vis.plot_optimization_history(study, target=metric).write_html(
-                metric_dir / "optuna_optimization_history.html"
-            )
+            vis.plot_optimization_history(
+                study, target=lambda t: t.values[idx], target_name=metric
+            ).write_html(metric_dir / "optuna_optimization_history.html")
         except Exception as e:
             logging.warning(
                 f"[{metric}] Failed to create optimization history plot: {e}"
             )
-
         try:
-            vis.plot_param_importances(study, target=metric).write_html(
-                metric_dir / "optuna_param_importance.html"
-            )
-        except Exception as e:
-            logging.warning(f"[{metric}] Failed to create param importance plot: {e}")
-
-        try:
-            vis.plot_parallel_coordinate(study, target=metric).write_html(
-                metric_dir / "optuna_parallel_coordinates.html"
-            )
+            vis.plot_parallel_coordinate(
+                study, target=lambda t: t.values[idx], target_name=metric
+            ).write_html(metric_dir / "optuna_parallel_coordinates.html")
         except Exception as e:
             logging.warning(
                 f"[{metric}] Failed to create parallel coordinate plot: {e}"
             )
 
         try:
-            vis.plot_contour(study, target=metric).write_html(
-                metric_dir / "optuna_contour_plot.html"
-            )
+            vis.plot_contour(
+                study, target=lambda t: t.values[idx], target_name=metric
+            ).write_html(metric_dir / "optuna_contour_plot.html")
         except Exception as e:
             logging.warning(f"[{metric}] Failed to create contour plot: {e}")
 
@@ -330,12 +338,18 @@ for metric in objective_builder.objectives:
 
 # Additional per-metric plots and Pareto front (for multi-objective)
 try:
-    # Determine metric keys: for multi-objective, use objective_builder.objectives
-    # Pareto front
-    try:
-        vis.plot_pareto_front(study).write_html(optuna_dir / "optuna_pareto_front.html")
-    except Exception as e:
-        logging.warning(f"Failed to create pareto front plot: {e}")
+    # Pareto front: only works with 2-3 objectives
+    if len(objective_builder.objectives) <= 3:
+        try:
+            vis.plot_pareto_front(study).write_html(
+                optuna_dir / "optuna_pareto_front.html"
+            )
+        except Exception as e:
+            logging.warning(f"Failed to create pareto front plot: {e}")
+    else:
+        logging.info(
+            f"Skipping Pareto front plot: {len(objective_builder.objectives)} objectives exceed 3-objective limit"
+        )
 
     # Per-objective optimization history from trial.values
     for idx, metric in enumerate(objective_builder.objectives):
@@ -470,32 +484,87 @@ try:
                             busco_lineage=args.busco_lineage,
                             download_path=download_path,
                         )
-                        logging.info(f"Final assembly metrics: {metrics}")
+
+                        # Format and log the raw metrics
+                        # BUSCO metrics are counts, convert to percentages
+                        total_busco = (
+                            metrics.get("single_copy", 0)
+                            + metrics.get("multi_copy", 0)
+                            + metrics.get("fragmented", 0)
+                            + metrics.get("missing", 0)
+                        )
+                        single_copy_pct = (
+                            (metrics.get("single_copy", 0) / total_busco * 100)
+                            if total_busco > 0
+                            else 0
+                        )
+                        multi_copy_pct = (
+                            (metrics.get("multi_copy", 0) / total_busco * 100)
+                            if total_busco > 0
+                            else 0
+                        )
+                        fragmented_pct = (
+                            (metrics.get("fragmented", 0) / total_busco * 100)
+                            if total_busco > 0
+                            else 0
+                        )
+                        missing_pct = (
+                            (metrics.get("missing", 0) / total_busco * 100)
+                            if total_busco > 0
+                            else 0
+                        )
+
+                        metrics_str = "Final assembly metrics:\n"
+                        metrics_str += f"  - Number of contigs: {int(metrics.get('num_contigs', 0))}\n"
+                        metrics_str += f"  - Length difference: {metrics.get('length_diff', 0):.2f} Mb\n"
+                        metrics_str += f"  - N50: {int(metrics.get('n50', 0)):.0f} bp\n"
+                        metrics_str += f"  - L50: {int(metrics.get('l50', 0))}\n"
+                        metrics_str += f"  - Mapping error rate: {metrics.get('error_rate', 0):.4f}\n"
+                        metrics_str += f"  - Number of large-scale misassemblies: {int(metrics.get('num_sv', 0))}\n"
+                        metrics_str += (
+                            f"  - Single copy BUSCOs: {single_copy_pct:.2f}%\n"
+                        )
+                        metrics_str += f"  - Multi-copy BUSCOs: {multi_copy_pct:.2f}%\n"
+                        metrics_str += f"  - Fragmented BUSCOs: {fragmented_pct:.2f}%\n"
+                        metrics_str += f"  - Missing BUSCOs: {missing_pct:.2f}%"
+
+                        logging.info(metrics_str)
                     except Exception as e:
                         logging.error(f"Final assembly evaluation failed: {e}")
 
             else:
                 logging.error(f"Final hifiasm run exited with code {rc}")
 
-        # Remove trial assemblies and associated files
+        # Remove trial assemblies, alignment files, and associated files
         try:
             import shutil
 
             removed = 0
-            for p in Path.cwd().rglob("trial_assembly*"):
-                try:
-                    if p.is_file():
-                        p.unlink()
-                        removed += 1
-                    elif p.is_dir():
-                        shutil.rmtree(p)
-                        removed += 1
-                except Exception:
-                    logging.warning(f"Failed to remove trial artifact: {p}")
-            logging.info(f"Cleaned up {removed} trial assembly artifacts.")
+            # Remove trial assembly files and directories
+            for pattern in ["trial_assembly*", "alignment*", "trial_*"]:
+                for p in Path.cwd().rglob(pattern):
+                    try:
+                        if p.is_file():
+                            p.unlink()
+                            removed += 1
+                        elif p.is_dir():
+                            shutil.rmtree(p)
+                            removed += 1
+                    except Exception:
+                        logging.warning(f"Failed to remove trial artifact: {p}")
+            logging.info(
+                f"Cleaned up {removed} trial assembly and alignment artifacts."
+            )
         except Exception as e:
             logging.warning(f"Failed to clean trial assemblies: {e}")
     else:
         logging.info("No best trial identified; skipping final assembly run.")
 except Exception as e:
     logging.error(f"Final assembly/evaluation failed: {e}")
+
+# --- FINAL CLEANUP ---
+try:
+    logging.info("Performing final cleanup of intermediate files...")
+    evaluator.cleanup_intermediate_files()
+except Exception as e:
+    logging.warning(f"Final cleanup encountered issues: {e}")

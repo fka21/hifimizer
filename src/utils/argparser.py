@@ -84,6 +84,12 @@ def get_args():
         action="store_true",
         help="Force rerun of optimization and assembly even if convergence was previously reached.",
     )
+    optimization.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility. If not set, results may vary between runs.",
+    )
 
     # Multi-objective options
     # Multi-criteria optimization is used by default (no CLI toggle).

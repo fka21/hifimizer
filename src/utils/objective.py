@@ -23,6 +23,7 @@ class ObjectiveBuilder:
         busco_lineage="metazoa_odb12",
         download_path=None,
         output_dir=None,
+        logs_dir=None,
         # multi-objective is the only supported mode now
         objectives=None,
     ):
@@ -48,12 +49,13 @@ class ObjectiveBuilder:
         self.hic1 = hic1
         self.hic2 = hic2
         self.ul = ul
+        self.logs_dir = logs_dir if logs_dir else Path.cwd() / "logs"
         self.sensitive = sensitive
         self.primary = primary
         self.include_busco = include_busco
         self.busco_lineage = busco_lineage
         self.download_path = download_path
-        self.subprocess_logger = SubprocessLogger()
+        self.subprocess_logger = SubprocessLogger(logs_dir=Path.cwd() / "logs")
 
         # Set up output directory for default assembly results
         if output_dir is None:
@@ -89,6 +91,7 @@ class ObjectiveBuilder:
                 threads=self.threads,
                 trial_id=trial_id,
                 download_path=self.download_path,
+                logs_dir=self.logs_dir,
             )
 
             # Define base assembly name

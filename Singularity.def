@@ -4,6 +4,7 @@ From: continuumio/miniconda3
 %files
     /projects/ferenc.kagan/hifimizer-docker/environment.yml /opt/project/environment.yml
     /projects/ferenc.kagan/hifimizer-docker/src /opt/project/src
+    /projects/ferenc.kagan/hifimizer-docker/weights.json /opt/project/weights.json
     /home/ferenc.kagan/.cache/optunahub/github.com /root/.cache/optunahub/github.com
 
 %post
