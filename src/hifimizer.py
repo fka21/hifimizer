@@ -121,7 +121,9 @@ if download_path and busco_lineage_exists(download_path, args.busco_lineage):
     )
 else:
     evaluator.download_busco(lineage=args.busco_lineage)
-    evaluator.read_subsetting(num_reads=args.num_reads)
+
+# Always perform read subsetting, regardless of BUSCO download status
+evaluator.read_subsetting(num_reads=args.num_reads)
 # Initialize the objective function for Optuna
 objective_builder = ObjectiveBuilder(
     evaluator=evaluator,
@@ -207,7 +209,18 @@ try:
         for k in objective_keys
     ]
     # Create convergence detector configured for multi-objective directions
-    convergence_detector = MultiCriteriaConvergenceDetector(directions=directions)
+    # Tuned for faster detection: stagnation after 10 trials, plateau range 1e-3, relative improvement < 1%
+    convergence_detector = MultiCriteriaConvergenceDetector(
+        directions=directions,
+        stagnation_patience=10,
+        min_improvement=0,
+        threshold=0.01,  # 1% relative improvement threshold
+        patience=10,
+        plateau_threshold=1e-3,  # tighter plateau detection
+        min_plateau_length=10,
+        window_size=10,
+        significance_level=0.05,
+    )
 
     # If force rerun requested, attempt to delete existing study from storage
     load_if_exists = True
@@ -412,6 +425,7 @@ try:
             "n",
             "m",
             "p",
+            "u",
             # sensitive tuning params
             "D",
             "N",
@@ -535,25 +549,52 @@ try:
             else:
                 logging.error(f"Final hifiasm run exited with code {rc}")
 
-        # Remove trial assemblies, alignment files, and associated files
+        # Remove only top-level trial artifacts and sniffles outputs (non-recursive)
         try:
             import shutil
 
             removed = 0
-            # Remove trial assembly files and directories
-            for pattern in ["trial_assembly*", "alignment*", "trial_*"]:
-                for p in Path.cwd().rglob(pattern):
+            cwd = Path.cwd()
+
+            # Remove top-level files and directories starting with 'trial'
+            for p in cwd.glob("trial*"):
+                try:
+                    # Skip anything inside the logs directory
                     try:
-                        if p.is_file():
-                            p.unlink()
-                            removed += 1
-                        elif p.is_dir():
-                            shutil.rmtree(p)
-                            removed += 1
+                        if logs_dir is not None and logs_dir.exists():
+                            resolved_logs = logs_dir.resolve()
+                            try:
+                                if (
+                                    resolved_logs in p.resolve().parents
+                                    or p.resolve() == resolved_logs
+                                ):
+                                    continue
+                            except Exception:
+                                # If resolution fails, be conservative and skip deletion
+                                continue
                     except Exception:
-                        logging.warning(f"Failed to remove trial artifact: {p}")
+                        pass
+
+                    if p.is_file():
+                        p.unlink()
+                        removed += 1
+                    elif p.is_dir():
+                        shutil.rmtree(p)
+                        removed += 1
+                except Exception:
+                    logging.warning(f"Failed to remove trial artifact: {p}")
+
+            # Remove sniffles output files produced per trial in top-level output directory
+            for s in cwd.glob("sniffles_output_trial_*.vcf"):
+                try:
+                    if s.is_file():
+                        s.unlink()
+                        removed += 1
+                except Exception:
+                    logging.warning(f"Failed to remove sniffles output: {s}")
+
             logging.info(
-                f"Cleaned up {removed} trial assembly and alignment artifacts."
+                f"Cleaned up {removed} trial and sniffles artifacts (non-recursive)."
             )
         except Exception as e:
             logging.warning(f"Failed to clean trial assemblies: {e}")

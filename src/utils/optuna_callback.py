@@ -8,13 +8,13 @@ from scipy import stats
 class MultiCriteriaConvergenceDetector:
     def __init__(
         self,
-        stagnation_patience=15,
+        stagnation_patience=25,
         min_improvement=1e-4,
         threshold=0.001,
         patience=15,
         plateau_threshold=5e-1,
         min_plateau_length=15,
-        window_size=10,
+        window_size=20,
         significance_level=0.05,
         max_trials: Optional[int] = None,
         directions: Optional[list] = None,
@@ -46,7 +46,7 @@ class MultiCriteriaConvergenceDetector:
             self._last_result = (True, ["max_trials_reached"])
             return True, ["max_trials_reached"]
 
-        if trial_number < 15 and not hasattr(self, "_last_result"):
+        if trial_number < 5 and not hasattr(self, "_last_result"):
             self._last_result = (False, [])
             return False, []
         else:
@@ -79,7 +79,9 @@ class MultiCriteriaConvergenceDetector:
             convergence_votes = sum(results.values())
             total_detectors = len(self.detectors)
 
-            has_converged = convergence_votes >= (total_detectors // 2 + 1)
+            # Lower voting threshold: require at least floor(N/2) detectors
+            # to agree (e.g., 2 of 4 -> faster convergence detection).
+            has_converged = convergence_votes >= max(1, total_detectors // 2)
             converged_methods = [name for name, result in results.items() if result]
 
             # Store last convergence result for external query
@@ -93,7 +95,7 @@ class MultiCriteriaConvergenceDetector:
             return self._last_result[0]
 
         votes = sum(getattr(det, "converged", False) for det in self.detectors.values())
-        return votes >= (len(self.detectors) // 2 + 1)
+        return votes >= max(1, (len(self.detectors) // 2))
 
 
 class PlateauDetector:
@@ -157,9 +159,13 @@ class RelativeImprovementDetector:
         self.history.append(current_value)
 
         if len(self.history) >= 2:
-            relative_improvement = (
-                self.history[-1] - self.history[-2] / self.history[-2]
-            )
+            # Avoid division by zero
+            if self.history[-2] == 0:
+                relative_improvement = float("inf") if self.history[-1] > 0 else 0.0
+            else:
+                relative_improvement = (
+                    self.history[-1] - self.history[-2]
+                ) / self.history[-2]
 
             if relative_improvement < self.threshold:
                 self.poor_improvement_count += 1
@@ -179,14 +185,19 @@ class StagnationDetector:
 
     def update(self, current_value, trial_number):
         """Update convergence tracker with new value"""
-        if (
-            self.best_value is None
-            or current_value > self.best_value + self.min_improvement
-        ):
+        if self.best_value is None:
+            self.best_value = current_value
+            self.stagnation_count = 0
+        elif current_value > self.best_value + self.min_improvement:
+            # Significant improvement found
             self.best_value = current_value
             self.stagnation_count = 0
         else:
+            # No significant improvement
             self.stagnation_count += 1
+            # Update best_value if current is better (but not by min_improvement threshold)
+            if current_value > self.best_value:
+                self.best_value = current_value
 
         self.convergence_history.append(
             {

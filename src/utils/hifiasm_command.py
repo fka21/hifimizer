@@ -14,6 +14,7 @@ def build_hifiasm_command(
     n=None,
     m=None,
     p=None,
+    u=None,
     haploid_genome_size=None,
     threads=None,
     sensitive=False,
@@ -61,6 +62,9 @@ def build_hifiasm_command(
 
     if not None in [x, y, s, n, m, p]:
         cmd += f"-x {x} -y {y} -s {s} -n {n} -m {m} -p {p} "
+
+    if u is not None:
+        cmd += f"-u {u} "
 
     if hic1 and hic2:
         cmd += f"--h1 {hic1} --h2 {hic2} "
