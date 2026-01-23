@@ -133,6 +133,7 @@ class ObjectiveBuilder:
                 n = trial.suggest_int("n", 0, 10)
                 m = trial.suggest_int("m", 500_000, 20_000_000, log=True)
                 p = trial.suggest_int("p", 1, 10_000, log=True)
+                u = trial.suggest_categorical("u", [0, 1])
 
                 hic_params = {}
                 ont_params = {}
@@ -176,6 +177,7 @@ class ObjectiveBuilder:
                         n=n,
                         m=m,
                         p=p,
+                        u=u,
                         haploid_genome_size=self.haploid_genome_size,
                         threads=self.threads,
                         sensitive=True,
@@ -197,6 +199,7 @@ class ObjectiveBuilder:
                         n=n,
                         m=m,
                         p=p,
+                        u=u,
                         haploid_genome_size=self.haploid_genome_size,
                         threads=self.threads,
                         sensitive=False,

@@ -229,7 +229,7 @@ class AssemblyEvaluator:
 
         command = (
             f"busco -i {fasta_file} -l {lineage} -m {mode} -o {output_dir} "
-            f"-c {self.threads} --metaeuk --skip_bbtools --force"
+            f"-c {self.threads} --metaeuk --skip_bbtools --force --offline"
         )
         if download_path:
             command += f" --download_path {download_path}"
