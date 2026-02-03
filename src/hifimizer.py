@@ -6,6 +6,7 @@ from pathlib import Path
 import optuna.visualization as vis
 import optunahub
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import math
 from utils.assembly_eval import AssemblyEvaluator
 from utils.optuna_callback import MultiCriteriaConvergenceDetector
@@ -37,13 +38,6 @@ def get_terminate_status():
 
 signal.signal(signal.SIGINT, terminate_all_processes)
 signal.signal(signal.SIGTERM, terminate_all_processes)
-
-# Setup sampler visualizer
-module = optunahub.load_module(
-    package="visualization/tpe_acquisition_visualizer", force_reload=False
-)
-
-tpe_acquisition_visualizer = module.TPEAcquisitionVisualizer()
 
 # Parse command line arguments
 args = get_args()
@@ -139,6 +133,7 @@ objective_builder = ObjectiveBuilder(
     busco_lineage=args.busco_lineage,
     download_path=download_path,
     logs_dir=logs_dir,
+    is_multi_objective=args.multi_objective,
 )
 # Build the objective function
 objective = objective_builder.build_objective()
@@ -180,10 +175,13 @@ def convergence_callback(study, trial):
         )
 
 
-# Callback to track best trial so far using aggregate_score user attribute
+# Callback to track best trial so far using weighted_score (single-obj) or aggregate_score (multi-obj)
 def best_tracker_callback(study, trial):
     try:
-        s = trial.user_attrs.get("aggregate_score", None)
+        # Try weighted_score first (single-objective), then aggregate_score (multi-objective)
+        s = trial.user_attrs.get("weighted_score", None)
+        if s is None:
+            s = trial.user_attrs.get("aggregate_score", None)
         if s is None:
             return
 
@@ -194,7 +192,7 @@ def best_tracker_callback(study, trial):
             study.set_user_attr("best_trial", trial.number)
             params = trial.user_attrs.get("params", dict(trial.params))
             logging.info(
-                f"New best so far: trial {trial.number} score={s} params={params}"
+                f"New best so far: trial {trial.number} score={s:.2f} params={params}"
             )
     except Exception:
         return
@@ -202,25 +200,75 @@ def best_tracker_callback(study, trial):
 
 # Run optimization
 try:
-    # Create a multi-objective Optuna study. Directions derived from evaluator weights.
-    objective_keys = objective_builder.objectives
-    directions = [
-        "maximize" if evaluator.weights.get(k, 0) > 0 else "minimize"
-        for k in objective_keys
-    ]
-    # Create convergence detector configured for multi-objective directions
-    # Tuned for faster detection: stagnation after 10 trials, plateau range 1e-3, relative improvement < 1%
-    convergence_detector = MultiCriteriaConvergenceDetector(
-        directions=directions,
-        stagnation_patience=10,
-        min_improvement=0,
-        threshold=0.01,  # 1% relative improvement threshold
-        patience=10,
-        plateau_threshold=1e-3,  # tighter plateau detection
-        min_plateau_length=10,
-        window_size=10,
-        significance_level=0.05,
-    )
+    # Configure optimization based on mode (single vs multi-objective)
+    if args.multi_objective:
+        # Multi-objective setup
+        objective_keys = objective_builder.objectives
+
+        # Load optimization directions from src/optim_directions.json (no weights.json fallback)
+        # Format: { "metric_name": "maximize" | "minimize", ... }
+        directions_file = Path(__file__).resolve().parent / "optim_directions.json"
+        try:
+            import json
+
+            if not directions_file.exists():
+                raise FileNotFoundError(
+                    f"optim_directions.json not found at {directions_file}"
+                )
+
+            with open(directions_file, "r") as fh:
+                mapping = json.load(fh) or {}
+
+            directions = []
+            for k in objective_keys:
+                v = mapping.get(k, None)
+                if v in ("maximize", "minimize"):
+                    directions.append(v)
+                elif v is None:
+                    raise ValueError(
+                        f"Missing direction for metric '{k}' in optim_directions.json"
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid direction '{v}' for metric '{k}'; must be 'maximize' or 'minimize'"
+                    )
+        except Exception as e:
+            logging.error(f"Failed to load optim_directions.json: {e}")
+            raise
+        # Create convergence detector configured for multi-objective directions
+        # Tuned for faster detection: stagnation after 10 trials, plateau range 1e-3, relative improvement < 1%
+        convergence_detector = MultiCriteriaConvergenceDetector(
+            directions=directions,
+            stagnation_patience=10,
+            min_improvement=0,
+            threshold=0.01,  # 1% relative improvement threshold
+            patience=10,
+            plateau_threshold=1e-3,  # tighter plateau detection
+            min_plateau_length=10,
+            window_size=10,
+            significance_level=0.05,
+        )
+
+        # Use MOEAD sampler for multi-objective optimization
+        try:
+            moead_module = optunahub.load_module(
+                package="samplers/moead", force_reload=False
+            )
+            sampler = moead_module.MOEADSampler(seed=args.seed)
+            logging.info("Using MOEAD sampler for multi-objective optimization")
+        except Exception as e:
+            logging.warning(
+                f"MOEAD not available ({e}), falling back to NSGAIIISampler"
+            )
+            sampler = optuna.samplers.NSGAIIISampler(seed=args.seed)
+    else:
+        # Single-objective setup
+        directions = ["maximize"]  # Single direction for weighted score
+        convergence_detector = None  # No convergence detector for single-objective
+        sampler = optuna.samplers.TPESampler(seed=args.seed)
+        logging.info(
+            "Using TPE sampler for single-objective optimization (weighted score)"
+        )
 
     # If force rerun requested, attempt to delete existing study from storage
     load_if_exists = True
@@ -239,6 +287,57 @@ try:
                 f"Could not delete existing study (may not exist or storage issue): {e}"
             )
 
+        # Clean up previous run results: final assembly, logs, plots, and default_assembly
+        import shutil
+
+        cwd = Path.cwd()
+        removed_items = []
+
+        # Remove final assembly files
+        for pattern in ["final_assembly*"]:
+            for p in cwd.glob(pattern):
+                try:
+                    if p.is_file():
+                        p.unlink()
+                        removed_items.append(str(p))
+                    elif p.is_dir():
+                        shutil.rmtree(p)
+                        removed_items.append(str(p))
+                except Exception as e:
+                    logging.warning(f"Failed to remove {p}: {e}")
+
+        # Remove old logs directory
+        old_logs = cwd / "logs"
+        if old_logs.exists():
+            try:
+                shutil.rmtree(old_logs)
+                removed_items.append(str(old_logs))
+            except Exception as e:
+                logging.warning(f"Failed to remove logs directory: {e}")
+
+        # Remove optuna output and plots
+        optuna_output = cwd / "optuna_output"
+        if optuna_output.exists():
+            try:
+                shutil.rmtree(optuna_output)
+                removed_items.append(str(optuna_output))
+            except Exception as e:
+                logging.warning(f"Failed to remove optuna_output directory: {e}")
+
+        # Remove default_assembly from previous run
+        default_assembly = cwd / "default_assembly"
+        if default_assembly.exists():
+            try:
+                shutil.rmtree(default_assembly)
+                removed_items.append(str(default_assembly))
+            except Exception as e:
+                logging.warning(f"Failed to remove default_assembly directory: {e}")
+
+        if removed_items:
+            logging.info(
+                f"Cleaned up {len(removed_items)} previous run artifacts: {', '.join([Path(p).name for p in removed_items])}"
+            )
+
     # Reduce Optuna library verbosity (suppress per-trial value printing)
     try:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -253,7 +352,7 @@ try:
         directions=directions,
         storage=evaluator.db_uri,
         load_if_exists=load_if_exists,
-        sampler=optuna.samplers.TPESampler(seed=args.seed),
+        sampler=sampler,
     )
 
     # Existing study handling: if not forcing rerun, continue from existing trials.
@@ -262,40 +361,75 @@ try:
             f"Resuming existing study with {len(study.trials)} trials. Use --force-rerun to start fresh."
         )
 
+    mode_str = (
+        "multi-objective"
+        if args.multi_objective
+        else "single-objective (weighted score)"
+    )
     logging.info(
-        "Starting Optuna multi-objective optimization with up to %d trials.",
+        "Starting Optuna %s optimization with up to %d trials.",
+        mode_str,
         args.num_trials,
     )
-    # No single-objective convergence callbacks are used for multi-objective runs
+    # Use convergence callback only for multi-objective
+    callbacks = [best_tracker_callback]
+    if args.multi_objective:
+        callbacks.append(convergence_callback)
     study.optimize(
         objective,
         n_trials=args.num_trials,
-        callbacks=[best_tracker_callback, convergence_callback],
+        callbacks=callbacks,
     )
-    # Multi-objective optimization completed. No single "best" trial exists.
+    # Optimization completed
     if len(study.trials) == 0:
         logging.info("No successful trials were completed.")
     else:
-        logging.info(
-            f"Study completed with {len(study.trials)} trials. Use the Pareto front and per-trial metrics to select a preferred solution."
-        )
+        if args.multi_objective:
+            logging.info(
+                f"Multi-objective optimization completed with {len(study.trials)} trials. Use the Pareto front to select a preferred solution."
+            )
+        else:
+            logging.info(
+                f"Single-objective optimization completed with {len(study.trials)} trials. Best weighted score: {study.best_value:.2f}"
+            )
 
-        # Track best trial by aggregate_score user attribute (higher is better)
+        # Track best trial: prefer study-stored best_trial from callback,
+        # fallback to scanning trials by score user_attr (weighted_score for single-objective, aggregate_score for multi)
         best_trial = None
         best_score = float("-inf")
-        for t in study.trials:
-            try:
-                s = t.user_attrs.get("aggregate_score", None)
-                if s is not None and s > best_score:
-                    best_score = s
-                    best_trial = t
-            except Exception:
-                continue
+        score_key = "aggregate_score" if args.multi_objective else "weighted_score"
+
+        try:
+            bt_num = study.user_attrs.get("best_trial", None)
+            if bt_num is not None:
+                for t in study.trials:
+                    if t.number == bt_num:
+                        best_trial = t
+                        best_score = t.user_attrs.get(score_key, float("-inf"))
+                        break
+        except Exception:
+            best_trial = None
+            best_score = float("-inf")
+
+        if best_trial is None:
+            best_score = float("-inf")
+            for t in study.trials:
+                try:
+                    s = t.user_attrs.get(score_key, None)
+                    if s is None:
+                        continue
+                    s_val = float(s)
+                    if s_val > best_score:
+                        best_score = s_val
+                        best_trial = t
+                except Exception:
+                    continue
 
         if best_trial is not None:
             logging.info(
                 f"\n############################################\n"
-                f"\nBest trial by aggregate_score: {best_trial.number} score={best_score} params={best_trial.user_attrs.get('params', {})}\n"
+                f"\nBest trial: {best_trial.number}\nScore: {best_score:.2f}\n"
+                f"Params: {best_trial.user_attrs.get('params', {})}\n"
                 f"\n############################################"
             )
 
@@ -316,85 +450,135 @@ try:
 except Exception as e:
     logging.warning(f"Failed to create param importance plot: {e}")
 
-# Save visualizations as interactive HTML files per metric (multi-objective requires a target lambda)
-for idx, metric in enumerate(objective_builder.objectives):
+# Save visualizations as interactive HTML files
+if args.multi_objective:
+    # Multi-objective: create plots per metric
+    for idx, metric in enumerate(objective_builder.objectives):
+        try:
+            metric_dir = optuna_dir / metric
+            metric_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                vis.plot_optimization_history(
+                    study, target=lambda t: t.values[idx], target_name=metric
+                ).write_html(metric_dir / "optuna_optimization_history.html")
+            except Exception as e:
+                logging.warning(
+                    f"[{metric}] Failed to create optimization history plot: {e}"
+                )
+            try:
+                vis.plot_parallel_coordinate(
+                    study, target=lambda t: t.values[idx], target_name=metric
+                ).write_html(metric_dir / "optuna_parallel_coordinates.html")
+            except Exception as e:
+                logging.warning(
+                    f"[{metric}] Failed to create parallel coordinate plot: {e}"
+                )
+
+            try:
+                vis.plot_contour(
+                    study, target=lambda t: t.values[idx], target_name=metric
+                ).write_html(metric_dir / "optuna_contour_plot.html")
+            except Exception as e:
+                logging.warning(f"[{metric}] Failed to create contour plot: {e}")
+
+        except Exception as e:
+            logging.warning(f"Failed to create {metric} visualizations: {e}")
+
+    # Additional per-metric plots and Pareto front (for multi-objective)
     try:
-        metric_dir = optuna_dir / metric
+        # Pareto front: only works with 2-3 objectives
+        if len(objective_builder.objectives) <= 3:
+            try:
+                vis.plot_pareto_front(study).write_html(
+                    optuna_dir / "optuna_pareto_front.html"
+                )
+            except Exception as e:
+                logging.warning(f"Failed to create pareto front plot: {e}")
+        else:
+            logging.info(
+                f"Skipping Pareto front plot: {len(objective_builder.objectives)} objectives exceed 3-objective limit"
+            )
+
+        # Per-objective optimization history from trial.values
+        for idx, metric in enumerate(objective_builder.objectives):
+            try:
+                fig = go.Figure()
+                trials = [t for t in study.trials if t.values is not None]
+                trial_numbers = [t.number for t in trials]
+                values = [t.values[idx] for t in trials]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=trial_numbers, y=values, mode="lines+markers", name=metric
+                    )
+                )
+                fig.update_layout(
+                    title=f"Optimization History: {metric}",
+                    xaxis_title="Trial",
+                    yaxis_title=metric,
+                )
+                fig.write_html(optuna_dir / metric / "optimization_history.html")
+            except Exception as e:
+                logging.warning(
+                    f"Failed to create optimization history for {metric}: {e}"
+                )
+    except Exception as e:
+        logging.warning(f"Failed to create additional metric visualizations: {e}")
+else:
+    # Single-objective: create standard plots
+    try:
+        # Optimization history
+        fig = vis.plot_optimization_history(study)
+        fig.write_html(optuna_dir / "optimization_history.html")
+
+        # Parallel coordinate plot
+        fig = vis.plot_parallel_coordinate(study)
+        fig.write_html(optuna_dir / "parallel_coordinate.html")
+
+        # Slice plot
+        fig = vis.plot_slice(study)
+        fig.write_html(optuna_dir / "slice.html")
+
+        # Contour plot (for 2D parameter space)
+        if len(study.best_params) >= 2:
+            fig = vis.plot_contour(study)
+            fig.write_html(optuna_dir / "contour.html")
+            
+    # Per-metric histories (same spirit as multi-objective)
+        metric_dir = optuna_dir / "metrics"
         metric_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            vis.plot_optimization_history(
-                study, target=lambda t: t.values[idx], target_name=metric
-            ).write_html(metric_dir / "optuna_optimization_history.html")
-        except Exception as e:
-            logging.warning(
-                f"[{metric}] Failed to create optimization history plot: {e}"
-            )
-        try:
-            vis.plot_parallel_coordinate(
-                study, target=lambda t: t.values[idx], target_name=metric
-            ).write_html(metric_dir / "optuna_parallel_coordinates.html")
-        except Exception as e:
-            logging.warning(
-                f"[{metric}] Failed to create parallel coordinate plot: {e}"
-            )
+        metrics_to_plot = objective_builder.objectives  # same metric list as elsewhere
 
-        try:
-            vis.plot_contour(
-                study, target=lambda t: t.values[idx], target_name=metric
-            ).write_html(metric_dir / "optuna_contour_plot.html")
-        except Exception as e:
-            logging.warning(f"[{metric}] Failed to create contour plot: {e}")
+        trials = [t for t in study.trials if t.user_attrs is not None]
+        xs = [t.number for t in trials]
+
+        for metric in metrics_to_plot:
+            ys = []
+            x2 = []
+            for t in trials:
+                v = t.user_attrs.get(metric, None)
+                if v is None:
+                    continue
+                x2.append(t.number)
+                ys.append(v)
+
+            if len(ys) < 2:
+                continue
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=x2, y=ys, mode="lines+markers", name=metric))
+            fig.update_layout(
+                title=f"Metric History: {metric}",
+                xaxis_title="Trial",
+                yaxis_title=metric,
+            )
+            fig.write_html(metric_dir / f"{metric}.history.html")
 
     except Exception as e:
-        logging.warning(f"Failed to create visualizations for metric {metric}: {e}")
+        logging.warning(f"Failed to create per-metric plots for single-objective: {e}")
 
-# Additional per-metric plots and Pareto front (for multi-objective)
-try:
-    # Pareto front: only works with 2-3 objectives
-    if len(objective_builder.objectives) <= 3:
-        try:
-            vis.plot_pareto_front(study).write_html(
-                optuna_dir / "optuna_pareto_front.html"
-            )
-        except Exception as e:
-            logging.warning(f"Failed to create pareto front plot: {e}")
-    else:
-        logging.info(
-            f"Skipping Pareto front plot: {len(objective_builder.objectives)} objectives exceed 3-objective limit"
-        )
-
-    # Per-objective optimization history from trial.values
-    for idx, metric in enumerate(objective_builder.objectives):
-        xs = []
-        ys = []
-        for t in study.trials:
-            if t.values is None:
-                continue
-            try:
-                val = t.values[idx]
-                if val is None or (
-                    isinstance(val, float) and (math.isnan(val) or math.isinf(val))
-                ):
-                    continue
-                xs.append(t.number)
-                ys.append(val)
-            except Exception:
-                continue
-        if xs and ys:
-            plt.figure()
-            plt.scatter(xs, ys)
-            plt.xlabel("trial")
-            plt.ylabel(metric)
-            plt.title(f"Optimization history: {metric}")
-            # save PNG per-metric into metric directory if created, else optuna_dir
-            metric_dir = optuna_dir / metric
-            if not metric_dir.exists():
-                metric_dir = optuna_dir
-            plt.savefig(metric_dir / f"optuna_history_{metric}.png")
-            plt.close()
-except Exception as e:
-    logging.warning(f"Failed to create additional metric visualizations: {e}")
 
 # --- FINAL ASSEMBLY: run with best parameters and evaluate ---
 try:
@@ -499,42 +683,51 @@ try:
                             download_path=download_path,
                         )
 
-                        # Format and log the raw metrics
-                        # BUSCO metrics are counts, convert to percentages
-                        total_busco = (
-                            metrics.get("single_copy", 0)
-                            + metrics.get("multi_copy", 0)
-                            + metrics.get("fragmented", 0)
-                            + metrics.get("missing", 0)
-                        )
+                        # Format and log the metrics
+                        # Metrics from evaluate_assembly are log-transformed: np.log(value + 1)
+                        # Reverse transformation: exp(log_value) - 1
+                        def reverse_log(log_val):
+                            return max(0, np.exp(log_val) - 1) if log_val else 0
+
+                        # Reverse log transformation for each metric
+                        num_contigs = int(reverse_log(metrics.get("num_contigs", 0)))
+                        n50 = int(reverse_log(metrics.get("n50", 0)))
+                        num_sv = int(reverse_log(metrics.get("num_sv", 0)))
+                        error_rate = reverse_log(metrics.get("error_rate", 0))
+
+                        # Length difference is stored as log of (abs_diff_mb + 1)
+                        length_diff_mb = reverse_log(metrics.get("length_diff", 0))
+
+                        # BUSCO counts need reverse log transformation, then convert to percentages
+                        single_copy = int(reverse_log(metrics.get("single_copy", 0)))
+                        multi_copy = int(reverse_log(metrics.get("multi_copy", 0)))
+                        fragmented = int(reverse_log(metrics.get("fragmented", 0)))
+                        missing = int(reverse_log(metrics.get("missing", 0)))
+
+                        total_busco = single_copy + multi_copy + fragmented + missing
                         single_copy_pct = (
-                            (metrics.get("single_copy", 0) / total_busco * 100)
-                            if total_busco > 0
-                            else 0
+                            (single_copy / total_busco * 100) if total_busco > 0 else 0
                         )
                         multi_copy_pct = (
-                            (metrics.get("multi_copy", 0) / total_busco * 100)
-                            if total_busco > 0
-                            else 0
+                            (multi_copy / total_busco * 100) if total_busco > 0 else 0
                         )
                         fragmented_pct = (
-                            (metrics.get("fragmented", 0) / total_busco * 100)
-                            if total_busco > 0
-                            else 0
+                            (fragmented / total_busco * 100) if total_busco > 0 else 0
                         )
                         missing_pct = (
-                            (metrics.get("missing", 0) / total_busco * 100)
-                            if total_busco > 0
-                            else 0
+                            (missing / total_busco * 100) if total_busco > 0 else 0
                         )
 
                         metrics_str = "Final assembly metrics:\n"
-                        metrics_str += f"  - Number of contigs: {int(metrics.get('num_contigs', 0))}\n"
-                        metrics_str += f"  - Length difference: {metrics.get('length_diff', 0):.2f} Mb\n"
-                        metrics_str += f"  - N50: {int(metrics.get('n50', 0)):.0f} bp\n"
-                        metrics_str += f"  - L50: {int(metrics.get('l50', 0))}\n"
-                        metrics_str += f"  - Mapping error rate: {metrics.get('error_rate', 0):.4f}\n"
-                        metrics_str += f"  - Number of large-scale misassemblies: {int(metrics.get('num_sv', 0))}\n"
+                        metrics_str += f"  - Number of contigs: {num_contigs}\n"
+                        metrics_str += (
+                            f"  - Length difference: {length_diff_mb:.2f} Mb\n"
+                        )
+                        metrics_str += f"  - N50: {n50} bp\n"
+                        metrics_str += f"  - Mapping error rate: {error_rate:.6f}\n"
+                        metrics_str += (
+                            f"  - Number of large-scale misassemblies: {num_sv}\n"
+                        )
                         metrics_str += (
                             f"  - Single copy BUSCOs: {single_copy_pct:.2f}%\n"
                         )
@@ -555,6 +748,7 @@ try:
 
             removed = 0
             cwd = Path.cwd()
+            default_assembly_dir = cwd / "default_assembly"
 
             # Remove top-level files and directories starting with 'trial'
             for p in cwd.glob("trial*"):
@@ -572,6 +766,13 @@ try:
                             except Exception:
                                 # If resolution fails, be conservative and skip deletion
                                 continue
+                    except Exception:
+                        pass
+
+                    # Skip default_assembly directory (preserve trial 0 results)
+                    try:
+                        if p.resolve() == default_assembly_dir.resolve():
+                            continue
                     except Exception:
                         pass
 

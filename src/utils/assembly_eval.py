@@ -75,14 +75,15 @@ class AssemblyEvaluator:
             "num_contigs": re.compile(r"# contigs:\s+(\d+)"),
             "length_diff": re.compile(r"Total contig length:\s+(\d+)"),
             "n50": re.compile(r"Contig N50:\s+(\d+)"),
-            "l50": re.compile(r"Contig L50:\s+(\d+)"),
         }
 
         self.stats_patterns = {
             "reads_mapped": re.compile(r"reads mapped:\s+(\d+)"),
-            "bases_mapped": re.compile(r"bases mapped \(cigar\):\s+(\d+)"),
             "error_rate": re.compile(
                 r"error rate:\s+([0-9]+\.?[0-9]*([eE][-+]?[0-9]+)?)"
+            ),
+            "supplementary_alignments": re.compile(
+                r"supplementary alignments:\s+(\d+)"
             ),
         }
 
@@ -229,7 +230,7 @@ class AssemblyEvaluator:
 
         command = (
             f"busco -i {fasta_file} -l {lineage} -m {mode} -o {output_dir} "
-            f"-c {self.threads} --metaeuk --skip_bbtools --force --offline"
+            f"-c {self.threads} --metaeuk --skip_bbtools --force"
         )
         if download_path:
             command += f" --download_path {download_path}"
@@ -272,13 +273,15 @@ class AssemblyEvaluator:
                 value = int(match.group(1))
                 if key == "length_diff":
                     # Return raw difference in megabases
-                    metrics[key] = abs(value - self.known_genome_size) / 1_000_000
+                    metrics[key] = np.log(
+                        (abs(value - self.known_genome_size) / 1_000_000) + 1
+                    )
                 elif key == "n50":
                     # Return raw N50 value
-                    metrics[key] = value
+                    metrics[key] = np.log(value + 1)
                 else:
                     # Return raw value
-                    metrics[key] = value
+                    metrics[key] = np.log(value + 1)
         return metrics
 
     def run_minimap2_align(self, fasta_file, reads_file, sam_file, threads=None):
@@ -395,7 +398,7 @@ class AssemblyEvaluator:
                 try:
                     value = float(match.group(1))
                     # Return raw values
-                    stats[key] = value
+                    stats[key] = np.log(value + 1)
                 except (ValueError, TypeError) as e:
                     self.logger.warning(f"Value conversion failed for {key}: {e}")
                     stats[key] = 0
@@ -462,7 +465,7 @@ class AssemblyEvaluator:
                         sv_count += 1
 
                 # Return raw count
-                metrics["num_sv"] = sv_count
+                metrics["num_sv"] = np.log(sv_count + 1)
                 self.logger.debug(f"Detected {sv_count} structural variants")
 
         except Exception as e:
@@ -486,10 +489,10 @@ class AssemblyEvaluator:
             data = json.load(f)
 
         metrics = {
-            "single_copy": data["results"]["Single copy BUSCOs"],
-            "multi_copy": data["results"]["Multi copy BUSCOs"],
-            "fragmented": data["results"]["Fragmented BUSCOs"],
-            "missing": data["results"]["Missing BUSCOs"],
+            "single_copy": np.log(data["results"]["Single copy BUSCOs"] + 1),
+            "multi_copy": np.log(data["results"]["Multi copy BUSCOs"] + 1),
+            "fragmented": np.log(data["results"]["Fragmented BUSCOs"] + 1),
+            "missing": np.log(data["results"]["Missing BUSCOs"] + 1),
         }
         return metrics
 
@@ -504,20 +507,20 @@ class AssemblyEvaluator:
             "num_contigs": -0.8,
             "length_diff": -1,
             "n50": 1,
-            "l50": -0.4,
             "single_copy": 1,
             "multi_copy": -0.7,
             "fragmented": -0.7,
             "missing": -1,
             "reads_mapped": 0.8,
-            "bases_mapped": 0.8,
             "error_rate": -1,
             "num_sv": -0.5,
+            "supplementary_alignments": -0.6,
         }
 
         # Candidate locations for user-editable config
         candidates = [
             Path.cwd() / "weights.json",
+            Path(__file__).parent / "weights.json",
             Path(__file__).resolve().parents[2] / "weights.json",
         ]
 
@@ -550,18 +553,78 @@ class AssemblyEvaluator:
 
     def calculate_weighted_sum(self, metrics):
         """
-        Calculate weighted sum of metrics using loaded weights.
+        Calculate weighted sum of metrics using log-transformed values directly.
 
         Args:
-            metrics (dict): Dictionary of metric scores.
+            metrics (dict): Dictionary of log-transformed metric scores (from parsing stage).
 
         Returns:
-            float: Weighted sum.
+            float: Weighted sum of log-transformed metrics (sum of weight × log_value).
         """
-        # Weighted-sum scoring removed — multicriteria optimization only.
-        raise RuntimeError(
-            "Weighted-sum scoring is disabled; use multicriteria optimization."
+        weighted_sum = 0.0
+        for metric_name, weight in self.weights.items():
+            log_value = metrics.get(metric_name, 0.0)
+            weighted_sum += weight * log_value
+        return weighted_sum
+
+    def analyze_metric_contributions(self, metrics):
+        """
+        Analyze the contribution of each metric to the weighted score.
+
+        Returns detailed breakdown of how each metric contributes to the final score.
+
+        Args:
+            metrics (dict): Already log-transformed metric values (from evaluation parsing).
+
+        Returns:
+            dict: Detailed contribution analysis including log-transformed values, weights,
+                  contributions, and proportions.
+        """
+        contributions = {}
+        weighted_sum = 0.0
+
+        # Calculate contribution of each metric
+        for metric_name, weight in self.weights.items():
+            log_value = float(metrics.get(metric_name, 0.0))
+            contribution = weight * log_value
+            weighted_sum += contribution
+
+            contributions[metric_name] = {
+                "log_value": log_value,
+                "weight": weight,
+                "contribution": contribution,
+            }
+
+        # Calculate proportions (percentage of total positive contributions)
+        positive_contributions = sum(
+            c["contribution"] for c in contributions.values() if c["contribution"] > 0
         )
+        negative_contributions = abs(
+            sum(
+                c["contribution"]
+                for c in contributions.values()
+                if c["contribution"] < 0
+            )
+        )
+
+        for metric_name, data in contributions.items():
+            if positive_contributions > 0 and data["contribution"] > 0:
+                data["proportion"] = (
+                    data["contribution"] / positive_contributions
+                ) * 100
+            elif negative_contributions > 0 and data["contribution"] < 0:
+                data["proportion"] = (
+                    abs(data["contribution"]) / negative_contributions
+                ) * 100
+            else:
+                data["proportion"] = 0.0
+
+        return {
+            "total_score": weighted_sum,
+            "positive_sum": positive_contributions,
+            "negative_sum": negative_contributions,
+            "contributions": contributions,
+        }
 
     def evaluate_assembly(
         self,
