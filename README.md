@@ -190,8 +190,5 @@ output/
 │
 ├── optuna_study.db              # Optuna study database which stores information of each metric
 |
-├── optuna_output/               # Visualizations provided by optuna and further plots of assembly metric evolution throughout the trials
-│   └── ...
-│
-└── logs/                        # Execution logs
+└──  optuna_output/               # Visualizations provided by optuna and further plots of assembly metric evolution throughout the trials
 ```
