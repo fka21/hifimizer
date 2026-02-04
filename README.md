@@ -26,6 +26,10 @@ Hifimizer treats assembly as an optimization problem:
 > While individual components are seeded where possible, full end-to-end
 > determinism is not guaranteed, especially under parallel execution.
 
+### Workflow overview
+
+![Hifimizer workflow](flowchart.svg)
+
 ---
 
 ## Installation options
@@ -78,6 +82,7 @@ apptainer exec \
   hifimizer-online.sif \
   src/hifimizer.py -h
 ```
+---
 
 ## Requirements
 * HiFi (PacBio CCS) reads
@@ -86,6 +91,7 @@ apptainer exec \
 * Sufficient computational power for repeated assemblies
 * Patience
 
+---
 ## Manual
 
 Below are listed the available options for running the tool.
@@ -173,6 +179,12 @@ Optional sequencing data or hifiasm settings:
 >
 > The `--sensitive` setting **can improve assemblies occasionally**, however it will significantly **increase runtime** as the read overlaps will be repeatedly re-calculated.
 
+---
+### Tips and tricks
+
+By default the tool uses a single weighted score for the objective function. The weights for each assembly metric are defined in `src/utils/weights.json`. These can be fine-tuned for each case. 
+
+---
 ## Output
 
 By default a `output/` directory is created in the current working directory.
