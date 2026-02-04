@@ -95,7 +95,7 @@ class MultiCriteriaConvergenceDetector:
             return self._last_result[0]
 
         votes = sum(getattr(det, "converged", False) for det in self.detectors.values())
-        return votes >= max(1, (len(self.detectors) // 2))
+        return votes >= 2
 
 
 class PlateauDetector:
@@ -212,68 +212,3 @@ class StagnationDetector:
 
     def has_converged(self):
         return self.stagnation_count >= self.patience
-
-
-class EarlyStoppingCallback:
-    """Callback to stop an Optuna study early if no improvement occurs.
-
-    This callback monitors the optimization Sprocess and stops the study if no
-    improvement is observed in the best value for a specified number of
-    consecutive trials.
-
-    DEPRECATED: Use `ConvergenceCallback` instead for better convergence detection.
-
-    Args:
-        early_stopping_rounds (int): Number of non-improving trials to wait before stopping.
-        direction (str, optional): Optimization direction ("minimize" or "maximize").
-            Defaults to "minimize".
-    """
-
-    def __init__(
-        self,
-        early_stopping_rounds: int,
-        direction: str = "minimize",
-        terminate_flag=None,
-    ) -> None:
-        self.early_stopping_rounds = early_stopping_rounds
-        self._iter = 0
-        self.terminate_flag = terminate_flag
-
-        if direction == "minimize":
-            import operator
-
-            self._operator = operator.lt
-            self._score = float("inf")
-        elif direction == "maximize":
-            import operator
-
-            self._operator = operator.gt
-            self._score = float("-inf")
-        else:
-            raise ValueError(
-                f"Invalid direction: {direction}. Use 'minimize' or 'maximize'."
-            )
-
-    def __call__(self, study: optuna.Study, trial: optuna.Trial) -> None:
-        """Check stopping condition and halt study if criteria are met.
-
-        Args:
-            study (optuna.Study): Current study object.
-            trial (optuna.Trial): Current trial object.
-        """
-        if self.terminate_flag and self.terminate_flag():
-            logging.info(
-                "EarlyStoppingCallback detected termination request. Stopping study."
-            )
-            study.stop()
-            return
-
-        if self._operator(study.best_value, self._score):
-            self._iter = 0
-            self._score = study.best_value
-        else:
-            self._iter += 1
-
-        if self._iter >= self.early_stopping_rounds:
-            logging.info("Early stopping triggered. Stopping study.")
-            study.stop()
