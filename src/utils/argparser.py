@@ -70,6 +70,11 @@ def get_args():
         help="BUSCO lineage database name",
     )
     optimization.add_argument(
+        "--multi-objective",
+        action="store_true",
+        help="Use multi-objective optimization (Pareto front). Default is single-objective optimization with weighted score.",
+    )
+    optimization.add_argument(
         "--default-hifiasm",
         action="store_true",
         help="Run hifiasm assembly without optimized parameters, i.e. use all default parameter settings. Note: default behaviour of hifimizer saves the default assembly results into a default_assembly folder in the output directory.",

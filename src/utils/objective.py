@@ -6,6 +6,17 @@ from utils.hifiasm_command import build_hifiasm_command
 from utils.subprocess_logger import SubprocessLogger
 from utils.assembly_eval import AssemblyEvaluator
 
+def _load_directions_map():
+    import json
+    from pathlib import Path
+
+    # Same convention you already use elsewhere
+    directions_file = Path(__file__).resolve().parent.parent / "optim_directions.json"
+    if directions_file.exists():
+        with open(directions_file, "r") as fh:
+            return json.load(fh) or {}
+    return {}
+
 
 class ObjectiveBuilder:
     def __init__(
@@ -26,6 +37,7 @@ class ObjectiveBuilder:
         logs_dir=None,
         # multi-objective is the only supported mode now
         objectives=None,
+        is_multi_objective=False,
     ):
         """
         Initialize the objective builder with necessary configuration.
@@ -64,8 +76,8 @@ class ObjectiveBuilder:
             self.output_dir = Path(output_dir).resolve()
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Multi-objective is the only supported behavior. Use evaluator.weights keys if objectives not provided.
-        self.multi_objective = True
+        # Support both single and multi-objective optimization
+        self.is_multi_objective = is_multi_objective
         if objectives:
             self.objectives = objectives
         else:
@@ -112,6 +124,7 @@ class ObjectiveBuilder:
             # Assenbly to compare to should be the assembly generated with default values
             if trial_id == 0:
                 params = {
+                    "base_name": "default_assembly",
                     "haploid_genome_size": self.haploid_genome_size,
                     "threads": self.threads,
                     "sensitive": self.sensitive,
@@ -261,36 +274,140 @@ class ObjectiveBuilder:
                         f"Default setting based assembly results moved to {default_dir.resolve()}"
                     )
 
-                # Build tuple of objective values in configured order
-                objective_values = tuple(
-                    float(metrics.get(k, 0)) for k in self.objectives
-                )
+                # Return based on optimization mode
+                if self.is_multi_objective:
+                    # Multi-objective: return tuple of objective values
+                    objective_values = tuple(
+                        float(metrics.get(k, 0)) for k in self.objectives
+                    )
 
-                # Compute a simple aggregate score for bookkeeping: signed average
-                try:
-                    signs = [
-                        1 if self.evaluator.weights.get(k, 0) > 0 else -1
-                        for k in self.objectives
-                    ]
-                    agg = sum(
-                        s * float(metrics.get(k, 0))
-                        for s, k in zip(signs, self.objectives)
-                    ) / max(1, len(self.objectives))
-                except Exception:
-                    agg = 0.0
+                    # Compute a simple aggregate score for bookkeeping: signed average
+                    # Use optim_directions.json to determine optimization direction
+                    try:
+                        import json
 
-                # Store aggregate score and trial parameters as user attributes for later inspection
-                try:
-                    trial.set_user_attr("aggregate_score", float(agg))
-                    trial.set_user_attr("params", dict(trial.params))
-                except Exception:
-                    pass
+                        directions_file = (
+                            Path(__file__).resolve().parent.parent
+                            / "optim_directions.json"
+                        )
+                        if directions_file.exists():
+                            with open(directions_file, "r") as fh:
+                                directions_map = json.load(fh)
+                        else:
+                            directions_map = {}
 
-                # Minimal logging: success and parameters
-                logging.info(
-                    f"Trial {trial_id}: Completed successfully. Params: {dict(trial.params)}"
-                )
-                return objective_values
+                        # Score normalization: maximize means positive contribution, minimize means negative
+                        signs = []
+                        for obj in self.objectives:
+                            dir_str = directions_map.get(obj, "maximize")
+                            sign = 1 if dir_str == "maximize" else -1
+                            signs.append(sign)
+
+                        # Normalize metric values to [0, 1] scale when possible for fair aggregation
+                        normalized_metrics = []
+                        for k in self.objectives:
+                            raw_val = float(metrics.get(k, 0))
+                            # For aggregate scoring, we just use the raw values with appropriate sign
+                            # The actual Pareto optimization happens via the multi-objective framework
+                            normalized_metrics.append(raw_val)
+
+                        agg = sum(
+                            s * v for s, v in zip(signs, normalized_metrics)
+                        ) / max(1, len(self.objectives))
+                    except Exception as e:
+                        logging.warning(f"Failed to compute aggregate score: {e}")
+                        agg = 0.0
+
+                    # Store aggregate score and trial parameters as user attributes for later inspection
+                    try:
+                        trial.set_user_attr("aggregate_score", float(agg))
+                        trial.set_user_attr("params", dict(trial.params))
+                    except Exception:
+                        pass
+
+                    # Minimal logging: success and parameters
+                    logging.info(
+                        f"Trial {trial_id}: Completed successfully. Params: {dict(trial.params)}"
+                    )
+                    return objective_values
+                else:
+                    # Single-objective: return weighted sum
+                    weighted_score = self.evaluator.calculate_weighted_sum(metrics)
+
+                    # Analyze metric contributions
+                    contribution_analysis = self.evaluator.analyze_metric_contributions(
+                        metrics
+                    )
+
+                    # Store score as user attribute for tracking
+                    try:
+                        trial.set_user_attr("weighted_score", float(weighted_score))
+                        trial.set_user_attr("params", dict(trial.params))
+                    except Exception:
+                        pass
+
+                    # Log the weighted score and metric contributions
+                    logging.info(
+                        f"Trial {trial_id}: Completed successfully. Weighted score: {weighted_score:.2f}"
+                    )
+
+                    # Log metric contributions
+                    directions_map = _load_directions_map()
+
+                    contribs = contribution_analysis["contributions"]
+                    pos_sum = float(contribution_analysis.get("positive_sum", 0.0))
+                    neg_sum = float(contribution_analysis.get("negative_sum", 0.0))
+
+                    # Partition by desired optimization direction, not by sign
+                    maximize_metrics = []
+                    minimize_metrics = []
+                    unknown_metrics = []
+
+                    for m, d in contribs.items():
+                        direction = directions_map.get(m, "unknown")
+                        if direction == "maximize":
+                            maximize_metrics.append((m, d))
+                        elif direction == "minimize":
+                            minimize_metrics.append((m, d))
+                        else:
+                            unknown_metrics.append((m, d))
+
+                    def _log_block(title, items, denom_pos, denom_neg):
+                        logging.info(title)
+                        for metric_name, data in items:
+                            contrib = float(data["contribution"])
+                            # “reward share” if positive, “penalty share” if negative
+                            if contrib >= 0 and denom_pos > 0:
+                                share = 100.0 * (contrib / denom_pos)
+                                share_label = "reward_share"
+                            elif contrib < 0 and denom_neg > 0:
+                                share = 100.0 * (abs(contrib) / denom_neg)
+                                share_label = "penalty_share"
+                            else:
+                                share = 0.0
+                                share_label = "share"
+
+                            logging.info(
+                                f"  {metric_name:25s} | log_value: {data['log_value']:12.2f} | "
+                                f"weight: {data['weight']:6.2f} | "
+                                f"contribution: {contrib:9.4f} | "
+                                f"{share_label}: {share:6.2f}%"
+                            )
+
+                    logging.info(f"\nTrial {trial_id} Metric Contributions (direction-aware):")
+
+                    _log_block("Maximize metrics (higher is better):", maximize_metrics, pos_sum, neg_sum)
+                    _log_block("Minimize metrics (lower is better):", minimize_metrics, pos_sum, neg_sum)
+
+                    if unknown_metrics:
+                        _log_block("Unknown-direction metrics (check optim_directions.json):", unknown_metrics, pos_sum, neg_sum)
+
+                    logging.info(
+                        f"  {'TOTAL':25s} | Positive sum: {pos_sum:.4f} | Negative sum: {neg_sum:.4f}\n"
+                    )
+
+
+                    return weighted_score
 
             except (
                 TimeoutError,
