@@ -160,7 +160,7 @@ class ObjectiveBuilder:
                                 "f_perturb", 0, 1, step=0.05
                             ),
                             "l_msjoin": trial.suggest_int(
-                                "l_msjoin", 0, 10_000_000, log=True
+                                "l_msjoin", 1, 10_000_000, log=True
                             ),
                         }
                     )
