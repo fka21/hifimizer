@@ -84,6 +84,7 @@ evaluator = AssemblyEvaluator(
     threads=threads,
     download_path=download_path,
     logs_dir=logs_dir,
+    ont=args.ont
 )
 
 if args.default_hifiasm:
@@ -96,6 +97,7 @@ if args.default_hifiasm:
         hic2=args.hic2,
         ul=args.ul,
         input_reads=input_reads,
+        ont=args.ont
     )
     exit(0)
 
@@ -107,7 +109,6 @@ def busco_lineage_exists(download_path, lineage):
     return download_path and os.path.exists(
         os.path.join(download_path, "lineages", lineage)
     )
-
 
 if download_path and busco_lineage_exists(download_path, args.busco_lineage):
     logging.info(
@@ -144,15 +145,13 @@ def convergence_callback(study, trial):
     # For multi-objective studies, use the trial values aggregated according to
     # the detector's internal directions. The detector accepts either a scalar
     # or a sequence of values.
-    current = None
-    if trial.values is not None:
-        current = tuple(trial.values)
-    else:
-        # Fallback to None (detectors should handle this safely)
-        current = None
+    current = trial.user_attrs.get("aggregate_score", None)
+    if current is None:
+        logging.warning(f"Trial {trial.number} has no usable score → skipping")
+        return
 
     has_converged, converged_methods = convergence_detector.update(
-        current, trial.number
+        float(current), trial.number
     )
 
     if has_converged:

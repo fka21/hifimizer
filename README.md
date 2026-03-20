@@ -61,7 +61,7 @@ Run:
 
 ```bash
 docker run --rm \
-  -v $(pwd):/opt/project \
+  -v $(pwd):/wd \
   fka21/hifimizer:latest \
   src/hifimizer.py -h
 ```
@@ -78,16 +78,20 @@ Example for running the tool:
 
 ```bash
 apptainer exec \
-  --bind $(pwd):/opt/project \
+  --bind $(pwd):/wd \
   hifimizer-online.sif \
   src/hifimizer.py -h
 ```
+
+> **Note**
+>
+> If the HPC environment cannot download the BUSCO database through BUSCO, please download it *a priori* and copy it to your HPC environment. Then specify the `--busco-download-path` when running `hifimizer`.
 ---
 
 ## Requirements
 * HiFi (PacBio CCS) reads
 * Genome size estimate
-* hifiasm - if not using containers
+* hifiasm should be on `$PATH` - if not using containers
 * Sufficient computational power for repeated assemblies
 * Patience
 
@@ -189,7 +193,7 @@ By default the tool uses a single weighted score for the objective function. The
 
 By default a `output/` directory is created in the current working directory.
 
-```bash
+```
 output/
 ├── final_assembly.*             # Optimized assembly results
 │
@@ -201,6 +205,6 @@ output/
 ├── busco_downloads/             # BUSCO database required for assembly evaluation (if BUSCO is used)
 │
 ├── optuna_study.db              # Optuna study database which stores information of each metric
-|
+│
 └──  optuna_output/               # Visualizations provided by optuna and further plots of assembly metric evolution throughout the trials
 ```

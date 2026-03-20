@@ -35,6 +35,7 @@ class ObjectiveBuilder:
         download_path=None,
         output_dir=None,
         logs_dir=None,
+        ont=False,
         # multi-objective is the only supported mode now
         objectives=None,
         is_multi_objective=False,
@@ -67,6 +68,7 @@ class ObjectiveBuilder:
         self.include_busco = include_busco
         self.busco_lineage = busco_lineage
         self.download_path = download_path
+        sef.ont = ont
         self.subprocess_logger = SubprocessLogger(logs_dir=Path.cwd() / "logs")
 
         # Set up output directory for default assembly results
@@ -132,6 +134,7 @@ class ObjectiveBuilder:
                     "hic2": self.hic2,
                     "ul": self.ul,
                     "primary": self.primary,
+                    "ont": self.ont
                 }
                 # Only keep non-None params
                 params = {k: v for k, v in params.items() if v is not None}
@@ -160,7 +163,7 @@ class ObjectiveBuilder:
                                 "f_perturb", 0, 1, step=0.05
                             ),
                             "l_msjoin": trial.suggest_int(
-                                "l_msjoin", 0, 10_000_000, log=True
+                                "l_msjoin", 1, 10_000_000, log=True
                             ),
                         }
                     )
@@ -203,6 +206,7 @@ class ObjectiveBuilder:
                         **hic_params,
                         **ont_params,
                         primary=self.primary,
+                        ont=self.ont
                     )
                 else:
                     command = build_hifiasm_command(
@@ -222,6 +226,7 @@ class ObjectiveBuilder:
                         **hic_params,
                         **ont_params,
                         primary=self.primary,
+                        ont=self.ont
                     )
 
                 command += f" {self.input_reads}"
