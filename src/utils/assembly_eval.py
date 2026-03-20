@@ -41,6 +41,7 @@ class AssemblyEvaluator:
         threads=None,
         download_path=None,
         logs_dir=None,
+        ont=False
     ):
         self.known_genome_size = known_genome_size
         self.input_reads = input_reads
@@ -51,6 +52,7 @@ class AssemblyEvaluator:
         self.db_uri = f"sqlite:///{self.db_path}"
         self.trial_id = trial_id
         self.threads = threads
+        self.ont = ont
         self.download_path = download_path
         self._compile_patterns()
 
@@ -66,6 +68,29 @@ class AssemblyEvaluator:
         self._compile_patterns()
         # Load metric weights from config (or use defaults)
         self.weights = self._load_weights()
+        
+        # Caches regarding busco gene prediction tool used
+        self.cache_path = Path("busco_backend_cache.json")
+        self.backend_cache = self._load_backend_cache()
+
+    def _load_backend_cache(self):
+        if self.cache_path.exists():
+            try:
+                with open(self.cache_path) as f:
+                    return json.load(f)
+            except Exception:
+                self.logger.warning("Failed to load BUSCO backend cache, starting fresh")
+        return {}
+
+    def _save_backend_cache(self):
+        try:
+            with open(self.cache_path, "w") as f:
+                json.dump(self.backend_cache, f, indent=2)
+        except Exception as e:
+            self.logger.warning(f"Failed to save BUSCO backend cache: {e}")
+            
+    def _get_minimap2_preset(self):
+        return "map-ont" if self.ont else "map-hifi"
 
     def _compile_patterns(self):
         """
@@ -228,33 +253,54 @@ class AssemblyEvaluator:
         """
         output_dir = f"busco_output_{os.path.basename(fasta_file).split('.')[0]}"
 
-        command = (
+        base_cmd = (
             f"busco -i {fasta_file} -l {lineage} -m {mode} -o {output_dir} "
-            f"-c {self.threads} --metaeuk --skip_bbtools --force"
+            f"-c {self.threads} --skip_bbtools --force"
         )
-        if download_path:
-            command += f" --download_path {download_path}"
 
+        if download_path:
+            base_cmd += f" --download_path {download_path}"
+
+        # -----------------------------
+        # 1. Try miniprot (default)
+        # -----------------------------
         try:
-            self.run_command(self, command, "busco")
-            # Locate the BUSCO short summary JSON file produced in the output directory.
-            out_dir_path = Path(output_dir)
-            # BUSCO may include different suffixes in the short_summary filename
-            # depending on the provided -o value; use a glob to find the JSON.
-            json_pattern = f"short_summary.specific.{lineage}.*.json"
-            matches = list(out_dir_path.glob(json_pattern))
-            if not matches:
-                # fallback to a more generic pattern
-                matches = list(out_dir_path.glob("short_summary.*.json"))
-            if not matches:
-                raise FileNotFoundError(
-                    f"BUSCO summary JSON not found in {output_dir} (pattern {json_pattern})"
-                )
-            busco_json_file = str(matches[0])
-            return self.parse_busco_results(busco_json_file)
-        except RuntimeError:
-            self.logger.error("BUSCO evaluation failed")
-            raise
+            self.logger.info("Running BUSCO with miniprot")
+            self.run_command(self, base_cmd, "busco_miniprot")
+            backend_used = "miniprot"
+
+        except RuntimeError as e:
+            self.logger.warning(f"Miniprot failed → retrying with MetaEuk: {e}")
+
+        # -----------------------------
+        # 2. Fallback to metaeuk
+        # -----------------------------
+            cmd_metaeuk = base_cmd + " --metaeuk"
+
+            try:
+                self.run_command(self, cmd_metaeuk, "busco_metaeuk")
+                backend_used = "metaeuk"
+
+            except RuntimeError:
+                self.logger.error("BUSCO failed with both miniprot and metaeuk")
+                raise
+            
+        # -----------------------------
+        # Parse output (unchanged)
+        # -----------------------------
+        out_dir_path = Path(output_dir)
+        matches = list(out_dir_path.glob(f"short_summary.specific.{lineage}.*.json"))
+        if not matches:
+            matches = list(out_dir_path.glob("short_summary.*.json"))
+        if not matches:
+            raise FileNotFoundError(f"BUSCO summary JSON not found in {output_dir}")
+
+        busco_json_file = str(matches[0])
+
+        results = self.parse_busco_results(busco_json_file)
+
+        return results
+
 
     def parse_gfastats_output(self, output):
         """
@@ -298,14 +344,57 @@ class AssemblyEvaluator:
             RuntimeError: If minimap2 exits with a non-zero code.
         """
         threads = threads or self.threads
-        command = f"minimap2 -t {threads} -ax map-hifi -o {sam_file} {fasta_file} {reads_file}"
+        reads_id = os.path.basename(reads_file)
+
+        # -----------------------------
+        # 1. Determine preset
+        # -----------------------------
+        preset = self._get_minimap2_preset()
+
+        # -----------------------------
+        # 2. Commands
+        # -----------------------------
+        mm2_cmd = (
+            f"minimap2 -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
+        )
+
+        mm2plus_cmd = (
+            f"mm2plus -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
+        )
+
+        # -----------------------------
+        # 3. Load / init aligner cache
+        # -----------------------------
+        if not hasattr(self, "aligner_cache"):
+            self.aligner_cache = self.backend_cache.get("aligner", {})
+
+        preferred = self.aligner_cache.get(reads_id, "mm2plus")
+
+        # -----------------------------
+        # 4. Execution logic
+        # -----------------------------
+        if preferred == "minimap2":
+            self.run_command(self, mm2_cmd, "minimap2")
+            return sam_file
 
         try:
-            self.run_command(self, command, "minimap2")
+            self.run_command(self, mm2plus_cmd, "mm2plus")
             return sam_file
-        except RuntimeError:
-            self.logger.error("Minimap2 alignment failed")
-            raise
+
+        except RuntimeError as e:
+            self.logger.warning(f"[FALLBACK] mm2plus failed → minimap2 ({e})")
+
+            # fallback
+            self.run_command(self, mm2_cmd, "minimap2")
+
+            # -----------------------------
+            # 5. Persist failure
+            # -----------------------------
+            self.aligner_cache[reads_id] = "minimap2"
+            self.backend_cache["aligner"] = self.aligner_cache
+            self._save_backend_cache()
+
+            return sam_file
 
     def convert_sam_to_bam(self, sam_file, bam_file=None, threads=None):
         """
@@ -324,7 +413,7 @@ class AssemblyEvaluator:
             bam_file = sam_file.replace(".sam", ".bam")
 
         # Convert SAM to BAM
-        command = f"samtools view -b -h -o {bam_file} {sam_file}"
+        command = f"samtools view -@ {threads} -b -h -o {bam_file} {sam_file}"
         try:
             self.run_command(self, command, "samtools_view")
         except RuntimeError:
@@ -548,7 +637,6 @@ class AssemblyEvaluator:
                     f"Failed to load weights from {p}: {e}"
                 )
 
-        return default_weights
         return default_weights
 
     def calculate_weighted_sum(self, metrics):

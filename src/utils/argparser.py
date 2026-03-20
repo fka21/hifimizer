@@ -54,7 +54,7 @@ def get_args():
     optimization.add_argument(
         "--num-reads",
         type=int,
-        default=10000,
+        default=100000,
         help="Number of reads to subset for minimap2",
     )
     optimization.add_argument(
@@ -106,5 +106,6 @@ def get_args():
     optional_inputs.add_argument("--hic1", type=str, help="Hi-C R1 reads file")
     optional_inputs.add_argument("--hic2", type=str, help="Hi-C R2 reads file")
     optional_inputs.add_argument("--ul", type=str, help="Ultra-long ONT reads file")
+    optional_inputs.add_argument("--ont", action="store_true", help="Use this flag if as input you provide ONT R10 simplex reads.",)
 
     return parser.parse_args()

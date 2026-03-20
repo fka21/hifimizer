@@ -31,7 +31,7 @@ def build_hifiasm_command(
     path_min=None,
     primary=False,
     default_only=False,
-    **extra_args,
+    ont=False
 ):
     """
     Constructs the hifiasm command string based on given parameters.
@@ -85,6 +85,8 @@ def build_hifiasm_command(
     if sensitive:
         if not None in [D, N, max_kocc]:
             cmd += f"-D {D} -N {N} --max-kocc {max_kocc} "
+    if ont:
+        cmd += f"--ont"
 
     return cmd.strip()
 
@@ -98,6 +100,7 @@ def run_default_hifiasm_assembly(
     hic2=None,
     ul=None,
     input_reads=None,
+    ont=False
 ):
     """
     Run a clean hifiasm assembly with default parameters only.
@@ -113,6 +116,7 @@ def run_default_hifiasm_assembly(
                 hic2=hic2,
                 ul=ul,
                 default_only=True,
+                ont=ont
             )
             + f" {input_reads}"
         )
