@@ -68,7 +68,7 @@ class ObjectiveBuilder:
         self.include_busco = include_busco
         self.busco_lineage = busco_lineage
         self.download_path = download_path
-        sef.ont = ont
+        self.ont = ont
         self.subprocess_logger = SubprocessLogger(logs_dir=Path.cwd() / "logs")
 
         # Set up output directory for default assembly results
@@ -106,6 +106,7 @@ class ObjectiveBuilder:
                 trial_id=trial_id,
                 download_path=self.download_path,
                 logs_dir=self.logs_dir,
+                ont=self.ont
             )
 
             # Define base assembly name
@@ -126,7 +127,7 @@ class ObjectiveBuilder:
             # Assenbly to compare to should be the assembly generated with default values
             if trial_id == 0:
                 params = {
-                    "base_name": "default_assembly",
+                    "prefix": "default_assembly",
                     "haploid_genome_size": self.haploid_genome_size,
                     "threads": self.threads,
                     "sensitive": self.sensitive,

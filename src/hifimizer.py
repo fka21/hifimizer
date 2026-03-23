@@ -135,6 +135,7 @@ objective_builder = ObjectiveBuilder(
     download_path=download_path,
     logs_dir=logs_dir,
     is_multi_objective=args.multi_objective,
+    ont=args.ont
 )
 # Build the objective function
 objective = objective_builder.build_objective()
@@ -598,6 +599,7 @@ try:
             hic1=hic1,
             hic2=hic2,
             ul=ul,
+            ont=args.ont
         )
 
         # copy relevant optimized parameters if present
