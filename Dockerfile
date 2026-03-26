@@ -33,6 +33,7 @@ RUN git clone https://github.com/at-cg/mm2-plus.git && \
 # 4. Your code
 # ----------------------------
 COPY src/ ./src/
+RUN chmod +x /opt/project/src/hifimizer.py
 ENV PATH="/opt/project/src:${PATH}"
 
 # ----------------------------

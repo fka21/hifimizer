@@ -1,0 +1,11 @@
+**/__pycache__
+**/*.pyc
+**/.git
+**/README.md
+**/output/
+**/test
+**/*fq.gz
+**/*fastq.gz
+**/*fastq
+**/*fq
+**/*sif

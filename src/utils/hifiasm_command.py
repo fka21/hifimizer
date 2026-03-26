@@ -127,9 +127,8 @@ def run_default_hifiasm_assembly(
     logger.info(f"Running clean hifiasm assembly with parameters:\n{command}")
 
     try:
-        return_code, log_path = loggerClass.run_command_with_logging(
-            command=command, log_filename="hifiasm.log", command_name="hifiasm"
-        )
+        subprocess_logger = SubprocessLogger(logs_dir=Path(prefix).parent / "logs")
+        return_code, log_path = subprocess_logger.run_command_with_logging(...)
     except RuntimeError as e:
         logger.error(str(e))
         exit(1)

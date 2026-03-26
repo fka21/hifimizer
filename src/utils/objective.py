@@ -1,5 +1,6 @@
-import subprocess
+import json
 import shutil
+import subprocess
 import logging
 from pathlib import Path
 from utils.hifiasm_command import build_hifiasm_command
@@ -7,10 +8,6 @@ from utils.subprocess_logger import SubprocessLogger
 from utils.assembly_eval import AssemblyEvaluator
 
 def _load_directions_map():
-    import json
-    from pathlib import Path
-
-    # Same convention you already use elsewhere
     directions_file = Path(__file__).resolve().parent.parent / "optim_directions.json"
     if directions_file.exists():
         with open(directions_file, "r") as fh:
@@ -89,6 +86,9 @@ class ObjectiveBuilder:
             except Exception:
                 self.objectives = ["n50", "single_copy", "missing"]
 
+        # Load directions map once here so it is not re-read on every trial
+        self.directions_map = _load_directions_map()
+
     def build_objective(self):
         """
         Build and return the objective function for Optuna optimization.
@@ -109,25 +109,24 @@ class ObjectiveBuilder:
                 ont=self.ont
             )
 
-            # Define base assembly name
-            base_name = "trial_assembly"
-
-            # Choose the suffix based on inputs
-            if self.hic1 and self.hic2:
-                suffix = "hic.hap1.p_ctg"
-            elif self.ul:
-                suffix = "bp.hap1.p_ctg"
-            else:
-                suffix = "bp.p_ctg"
-
-            # Define file names
-            gfa_file = f"{base_name}.{suffix}.gfa"
-            fasta_file = f"{base_name}.{suffix}.fasta"
-
-            # Assenbly to compare to should be the assembly generated with default values
+            # Trial 0 runs hifiasm with default parameters as the baseline.
+            # All subsequent trials suggest optimized parameters to beat it.
             if trial_id == 0:
+                base_name = "default_assembly"
+
+                # Choose suffix based on inputs
+                if self.hic1 and self.hic2:
+                    suffix = "hic.hap1.p_ctg"
+                elif self.ul:
+                    suffix = "bp.hap1.p_ctg"
+                else:
+                    suffix = "bp.p_ctg"
+
+                gfa_file = f"{base_name}.{suffix}.gfa"
+                fasta_file = f"{base_name}.{suffix}.fasta"
+
                 params = {
-                    "prefix": "default_assembly",
+                    "prefix": base_name,
                     "haploid_genome_size": self.haploid_genome_size,
                     "threads": self.threads,
                     "sensitive": self.sensitive,
@@ -135,15 +134,25 @@ class ObjectiveBuilder:
                     "hic2": self.hic2,
                     "ul": self.ul,
                     "primary": self.primary,
-                    "ont": self.ont
+                    "ont": self.ont,
                 }
-                # Only keep non-None params
                 params = {k: v for k, v in params.items() if v is not None}
-
-                command = build_hifiasm_command(**params)
-                command += f" {self.input_reads}"
+                command = build_hifiasm_command(**params) + f" {self.input_reads}"
             else:
-                # Parameters to optimize by default
+                base_name = "trial_assembly"
+
+                # Choose suffix based on inputs
+                if self.hic1 and self.hic2:
+                    suffix = "hic.hap1.p_ctg"
+                elif self.ul:
+                    suffix = "bp.hap1.p_ctg"
+                else:
+                    suffix = "bp.p_ctg"
+
+                gfa_file = f"{base_name}.{suffix}.gfa"
+                fasta_file = f"{base_name}.{suffix}.fasta"
+
+                # Parameters to optimize
                 x = trial.suggest_float("x", 0.59, 0.99, step=0.01)
                 y = trial.suggest_float("y", 0.01, 0.41, step=0.01)
                 s = trial.suggest_float("s", 0.55, 1, step=0.01)
@@ -188,46 +197,24 @@ class ObjectiveBuilder:
                     max_kocc = trial.suggest_int("max_kocc", 1000, 5000, step=100)
 
                     command = build_hifiasm_command(
-                        x=x,
-                        y=y,
-                        s=s,
-                        n=n,
-                        m=m,
-                        p=p,
-                        u=u,
+                        x=x, y=y, s=s, n=n, m=m, p=p, u=u,
                         haploid_genome_size=self.haploid_genome_size,
                         threads=self.threads,
                         sensitive=True,
-                        D=D,
-                        N=N,
-                        max_kocc=max_kocc,
-                        hic1=self.hic1,
-                        hic2=self.hic2,
-                        ul=self.ul,
-                        **hic_params,
-                        **ont_params,
-                        primary=self.primary,
-                        ont=self.ont
+                        D=D, N=N, max_kocc=max_kocc,
+                        hic1=self.hic1, hic2=self.hic2, ul=self.ul,
+                        **hic_params, **ont_params,
+                        primary=self.primary, ont=self.ont,
                     )
                 else:
                     command = build_hifiasm_command(
-                        x=x,
-                        y=y,
-                        s=s,
-                        n=n,
-                        m=m,
-                        p=p,
-                        u=u,
+                        x=x, y=y, s=s, n=n, m=m, p=p, u=u,
                         haploid_genome_size=self.haploid_genome_size,
                         threads=self.threads,
                         sensitive=False,
-                        hic1=self.hic1,
-                        hic2=self.hic2,
-                        ul=self.ul,
-                        **hic_params,
-                        **ont_params,
-                        primary=self.primary,
-                        ont=self.ont
+                        hic1=self.hic1, hic2=self.hic2, ul=self.ul,
+                        **hic_params, **ont_params,
+                        primary=self.primary, ont=self.ont,
                     )
 
                 command += f" {self.input_reads}"
@@ -267,17 +254,18 @@ class ObjectiveBuilder:
                 try:
                     for k, v in metrics.items():
                         trial.set_user_attr(k, float(v))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.debug(f"Trial {trial_id}: failed to set metric user attrs: {e}")
 
-                # Save results of default assembly into separate folder for trial 0
+                # Save default assembly outputs to a dedicated folder
                 if trial_id == 0:
                     default_dir = self.output_dir / "default_assembly"
                     default_dir.mkdir(parents=True, exist_ok=True)
-                    for file in Path(".").glob("trial_assembly*"):
-                        shutil.copy(str(file), default_dir / file.name)
+                    for f in Path(".").glob("default_assembly*"):
+                        if f.is_file():
+                            shutil.copy(str(f), default_dir / f.name)
                     logging.info(
-                        f"Default setting based assembly results moved to {default_dir.resolve()}"
+                        f"Default assembly results copied to {default_dir.resolve()}"
                     )
 
                 # Return based on optimization mode
@@ -290,35 +278,21 @@ class ObjectiveBuilder:
                     # Compute a simple aggregate score for bookkeeping: signed average
                     # Use optim_directions.json to determine optimization direction
                     try:
-                        import json
+                        directions_map = self.directions_map
 
-                        directions_file = (
-                            Path(__file__).resolve().parent.parent
-                            / "optim_directions.json"
-                        )
-                        if directions_file.exists():
-                            with open(directions_file, "r") as fh:
-                                directions_map = json.load(fh)
-                        else:
-                            directions_map = {}
-
-                        # Score normalization: maximize means positive contribution, minimize means negative
                         signs = []
                         for obj in self.objectives:
                             dir_str = directions_map.get(obj, "maximize")
                             sign = 1 if dir_str == "maximize" else -1
                             signs.append(sign)
 
-                        # Normalize metric values to [0, 1] scale when possible for fair aggregation
-                        normalized_metrics = []
-                        for k in self.objectives:
-                            raw_val = float(metrics.get(k, 0))
-                            # For aggregate scoring, we just use the raw values with appropriate sign
-                            # The actual Pareto optimization happens via the multi-objective framework
-                            normalized_metrics.append(raw_val)
+                        normalized_metrics = [
+                            float(metrics.get(k, 0)) for k in self.objectives
+                        ]
 
                         agg = sum(
-                            s * v for s, v in zip(signs, normalized_metrics)
+                            sign_val * val
+                            for sign_val, val in zip(signs, normalized_metrics)
                         ) / max(1, len(self.objectives))
                     except Exception as e:
                         logging.warning(f"Failed to compute aggregate score: {e}")
@@ -328,8 +302,8 @@ class ObjectiveBuilder:
                     try:
                         trial.set_user_attr("aggregate_score", float(agg))
                         trial.set_user_attr("params", dict(trial.params))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.debug(f"Trial {trial_id}: failed to set aggregate user attrs: {e}")
 
                     # Minimal logging: success and parameters
                     logging.info(
@@ -349,8 +323,8 @@ class ObjectiveBuilder:
                     try:
                         trial.set_user_attr("weighted_score", float(weighted_score))
                         trial.set_user_attr("params", dict(trial.params))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.debug(f"Trial {trial_id}: failed to set weighted_score user attrs: {e}")
 
                     # Log the weighted score and metric contributions
                     logging.info(
@@ -358,7 +332,7 @@ class ObjectiveBuilder:
                     )
 
                     # Log metric contributions
-                    directions_map = _load_directions_map()
+                    directions_map = self.directions_map
 
                     contribs = contribution_analysis["contributions"]
                     pos_sum = float(contribution_analysis.get("positive_sum", 0.0))
@@ -369,14 +343,14 @@ class ObjectiveBuilder:
                     minimize_metrics = []
                     unknown_metrics = []
 
-                    for m, d in contribs.items():
-                        direction = directions_map.get(m, "unknown")
+                    for metric_name, metric_data in contribs.items():
+                        direction = directions_map.get(metric_name, "unknown")
                         if direction == "maximize":
-                            maximize_metrics.append((m, d))
+                            maximize_metrics.append((metric_name, metric_data))
                         elif direction == "minimize":
-                            minimize_metrics.append((m, d))
+                            minimize_metrics.append((metric_name, metric_data))
                         else:
-                            unknown_metrics.append((m, d))
+                            unknown_metrics.append((metric_name, metric_data))
 
                     def _log_block(title, items, denom_pos, denom_neg):
                         logging.info(title)

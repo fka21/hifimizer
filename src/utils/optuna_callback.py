@@ -46,7 +46,7 @@ class MultiCriteriaConvergenceDetector:
             self._last_result = (True, ["max_trials_reached"])
             return True, ["max_trials_reached"]
 
-        if trial_number < 5 and not hasattr(self, "_last_result"):
+        if trial_number < 5:
             self._last_result = (False, [])
             return False, []
         else:
