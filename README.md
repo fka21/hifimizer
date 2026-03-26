@@ -91,7 +91,6 @@ apptainer exec \
 ## Requirements
 * HiFi (PacBio CCS) reads
 * Genome size estimate
-* hifiasm should be on `$PATH` - if not using containers
 * Sufficient computational power for repeated assemblies
 * Patience
 
@@ -101,30 +100,34 @@ apptainer exec \
 Below are listed the available options for running the tool.
 
 ```bash
-usage: hifimizer.py [-h] --genome-size GENOME_SIZE --input-reads INPUT_READS
-                    [--output-dir OUTPUT_DIR] [--threads THREADS]
+usage: hifimizer.py [-h] [--version] --genome-size GENOME_SIZE --input-reads
+                    INPUT_READS [--output-dir OUTPUT_DIR] [--threads THREADS]
                     [--ploidy PLOIDY]
                     [--busco-download-path BUSCO_DOWNLOAD_PATH] [--sensitive]
                     [--num-trials NUM_TRIALS] [--num-reads NUM_READS]
                     [--no-busco] [--busco-lineage BUSCO_LINEAGE]
                     [--multi-objective] [--default-hifiasm] [--primary]
-                    [--force-rerun] [--seed SEED] [--hic1 HIC1] [--hic2 HIC2]
-                    [--ul UL]
+                    [--force-rerun] [--dry-run] [--rerun-best] [--seed SEED]
+                    [--hic1 HIC1] [--hic2 HIC2] [--ul UL] [--ont]
 
-Optimize hifiasm assembled de novo genomes with Optuna. It enables various
-parameter optimizations for hifiasm assembly, including parameters associated
-with Hi-C and ultra-long reads. By default it optimizes the parameters: x, y,
-s, n, m, p. If sensitive mode is enabled, it also optimizes D, N, and max_kocc
-parameters. The script can also run hifiasm with default settings, Hi-C reads,
-and ultra-long reads. It also supports primary assembly only mode.
+Optimize hifiasm de novo genome assemblies with Optuna. Supports parameter
+optimization for standard HiFi, Hi-C, and ultra-long ONT assemblies. By
+default optimizes: x, y, s, n, m, p. Sensitive mode additionally optimizes D,
+N, and max_kocc. Genome size can be specified with a G/Gb (gigabases), M/Mb
+(megabases), or K/Kb (kilobases) suffix, or as a plain integer interpreted as
+megabases.
 
 options:
   -h, --help            show this help message and exit
+  --version             show program's version number and exit
 
 Required arguments:
   --genome-size GENOME_SIZE
-                        Haploid genome size in Mb (e.g., 300 for 300Mb)
-                        (default: None)
+                        Haploid genome size. Accepts a plain integer (treated
+                        as Mb) or a value with a suffix: G/Gb for gigabases,
+                        M/Mb for megabases, K/Kb for kilobases (e.g. 3G,
+                        1.5Gb, 300M, 300, 750k). Internally converted to whole
+                        megabases. (default: None)
   --input-reads INPUT_READS
                         Input HiFi reads file path (default: None)
 
@@ -151,7 +154,7 @@ Optimization options:
                         (default: 100)
   --num-reads NUM_READS
                         Number of reads to subset for minimap2 (default:
-                        10000)
+                        100000)
   --no-busco            Disable BUSCO metrics during evaluation. By default,
                         BUSCO metrics are included. (default: True)
   --busco-lineage BUSCO_LINEAGE
@@ -170,6 +173,15 @@ Optimization options:
                         long reads. (default: False)
   --force-rerun         Force rerun of optimization and assembly even if
                         convergence was previously reached. (default: False)
+  --dry-run             Validate inputs and environment without running any
+                        assemblies. Checks that all input files exist,
+                        required tools (hifiasm, busco, gfastats) are on PATH,
+                        and prints the trial-0 hifiasm command, then exits.
+                        (default: False)
+  --rerun-best          Skip optimization and rerun hifiasm using the best
+                        parameters recorded in an existing study. Requires
+                        that the previous run reached convergence.
+                        Incompatible with --force-rerun. (default: False)
   --seed SEED           Random seed for reproducibility. If not set, results
                         may vary between runs. (default: 42)
 
@@ -177,6 +189,8 @@ Optional sequencing data or hifiasm settings:
   --hic1 HIC1           Hi-C R1 reads file (default: None)
   --hic2 HIC2           Hi-C R2 reads file (default: None)
   --ul UL               Ultra-long ONT reads file (default: None)
+  --ont                 Use this flag if as input you provide ONT R10 simplex
+                        reads. (default: False)
 ```
 
 > **Note**
