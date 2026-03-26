@@ -1,3 +1,6 @@
+[![Docker Pulls](https://img.shields.io/docker/pulls/fka21/hifimizer?style=flat&logo=docker)](https://hub.docker.com/r/fka21/hifimizer)
+![CI](https://img.shields.io/github/actions/workflow/status/fka21/hifimizer/main.yml?style=flat&logo=github)
+
 # Hifimizer
 
 **Hifimizer** is a framework for optimizing *HiFi genome assembly* parameters using Bayesian optimization.
