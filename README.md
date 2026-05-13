@@ -48,6 +48,10 @@ conda env create -f environment.yml
 conda activate hifimizer
 ```
 
+> **Note**
+>
+> By default `hifimizer` uses `compleasm` for completeness evaluation, however there are conflicts with the conda environment creation. Please follow the [compleasm](https://github.com/huangnengCSU/compleasm) direct installation steps.
+
 Run
 ```bash
 python3 src/hifimizer.py -h
@@ -71,10 +75,10 @@ docker run --rm \
 
 ### Option 3: Singularity (for HPC environments)
 
-A definition file (Singularity.def) is included in this repository. Build the container:
+Building the container can be done by calling:
 
 ```bash
-apptainer build hifimizer.sif hifimizer.def
+apptainer build hifimizer.sif docker://fka21/hifimizer:latest
 ```
 
 Example for running the tool:
@@ -110,8 +114,9 @@ usage: hifimizer.py [-h] [--version] --genome-size GENOME_SIZE --input-reads
                     [--num-trials NUM_TRIALS] [--num-reads NUM_READS]
                     [--no-busco] [--busco-lineage BUSCO_LINEAGE]
                     [--multi-objective] [--default-hifiasm] [--primary]
-                    [--force-rerun] [--dry-run] [--rerun-best] [--seed SEED]
-                    [--hic1 HIC1] [--hic2 HIC2] [--ul UL] [--ont]
+                    [--force-rerun] [--dry-run] [--rerun-best]
+                    [--trial-walltime HOURS] [--seed SEED] [--hic1 HIC1]
+                    [--hic2 HIC2] [--ul UL] [--ont]
 
 Optimize hifiasm de novo genome assemblies with Optuna. Supports parameter
 optimization for standard HiFi, Hi-C, and ultra-long ONT assemblies. By
@@ -185,6 +190,12 @@ Optimization options:
                         parameters recorded in an existing study. Requires
                         that the previous run reached convergence.
                         Incompatible with --force-rerun. (default: False)
+  --trial-walltime HOURS
+                        Maximum wall-clock time in hours allowed for a single
+                        hifiasm trial. Trials that exceed this limit are
+                        killed, logged as timed-out, and pruned from the
+                        Optuna study. The final assembly step uses the same
+                        limit. Default: 24 hours. (default: 24.0)
   --seed SEED           Random seed for reproducibility. If not set, results
                         may vary between runs. (default: 42)
 

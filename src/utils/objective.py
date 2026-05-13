@@ -2,10 +2,12 @@ import json
 import shutil
 import subprocess
 import logging
+import numpy as np
 from pathlib import Path
 from utils.hifiasm_command import build_hifiasm_command
 from utils.subprocess_logger import SubprocessLogger
 from utils.assembly_eval import AssemblyEvaluator
+
 
 def _load_directions_map():
     directions_file = Path(__file__).resolve().parent.parent / "optim_directions.json"
@@ -33,6 +35,7 @@ class ObjectiveBuilder:
         output_dir=None,
         logs_dir=None,
         ont=False,
+        trial_walltime_hours=24.0,
         # multi-objective is the only supported mode now
         objectives=None,
         is_multi_objective=False,
@@ -66,6 +69,7 @@ class ObjectiveBuilder:
         self.busco_lineage = busco_lineage
         self.download_path = download_path
         self.ont = ont
+        self.trial_walltime_hours = trial_walltime_hours
         self.subprocess_logger = SubprocessLogger(logs_dir=Path.cwd() / "logs")
 
         # Set up output directory for default assembly results
@@ -89,6 +93,65 @@ class ObjectiveBuilder:
         # Load directions map once here so it is not re-read on every trial
         self.directions_map = _load_directions_map()
 
+    # ------------------------------------------------------------------ #
+    # Raw-value helpers
+    # ------------------------------------------------------------------ #
+    #
+    # Every metric stored in `metrics` is the log-transformed form
+    # `np.log(raw + 1)`. For human-readable logging we reverse the
+    # transformation and format each metric in its natural unit.
+
+    _BUSCO_KEYS = ("single_copy", "multi_copy", "fragmented", "missing")
+
+    @staticmethod
+    def _reverse_log(log_value):
+        """Reverse `np.log(raw + 1)` back to `raw`, robust to non-numeric input."""
+        try:
+            v = float(log_value)
+        except (TypeError, ValueError):
+            return 0.0
+        if v == 0:
+            return 0.0
+        try:
+            return max(0.0, float(np.exp(v) - 1))
+        except Exception:
+            return 0.0
+
+    @classmethod
+    def _format_raw_value(cls, metric_name, log_value, total_busco=None):
+        """Format a single metric's raw value in its natural unit."""
+        raw = cls._reverse_log(log_value)
+
+        if metric_name in ("num_contigs", "reads_mapped",
+                           "supplementary_alignments", "num_sv"):
+            return f"{int(round(raw))}"
+        if metric_name == "length_diff":
+            return f"{raw:.2f} Mb"
+        if metric_name == "n50":
+            return f"{int(round(raw))} bp"
+        if metric_name == "error_rate":
+            return f"{raw:.6f}"
+        if metric_name in cls._BUSCO_KEYS:
+            if total_busco and total_busco > 0:
+                return f"{int(round(raw))} ({raw / total_busco * 100:.2f}%)"
+            return f"{int(round(raw))}"
+        return f"{raw:.4f}"
+
+    @classmethod
+    def _log_raw_metrics(cls, trial_id, metrics):
+        """Emit a compact block of raw (un-log-transformed) metric values."""
+        # Total of BUSCO/compleasm marker counts, used to derive percentages.
+        total_busco = sum(
+            cls._reverse_log(metrics.get(k, 0)) for k in cls._BUSCO_KEYS
+        )
+
+        lines = [f"\nTrial {trial_id} raw metric values:"]
+        for k, v in metrics.items():
+            lines.append(
+                f"  {k:25s} : {cls._format_raw_value(k, v, total_busco)}"
+            )
+        logging.info("\n".join(lines))
+
     def build_objective(self):
         """
         Build and return the objective function for Optuna optimization.
@@ -106,13 +169,23 @@ class ObjectiveBuilder:
                 trial_id=trial_id,
                 download_path=self.download_path,
                 logs_dir=self.logs_dir,
-                ont=self.ont
+                ont=self.ont,
             )
 
             # Trial 0 runs hifiasm with default parameters as the baseline.
             # All subsequent trials suggest optimized parameters to beat it.
+            #
+            # NOTE: trial 0 deliberately shares the "trial_assembly" prefix with
+            # every other trial. hifiasm caches expensive intermediate state
+            # (error-corrected reads and read-overlaps) in files named
+            # <prefix>.ec.bin, <prefix>.ovlp.source.bin, <prefix>.ovlp.reverse.bin.
+            # By keeping the same prefix across trials, hifiasm can re-use these
+            # caches and skip the heaviest computation. The trial 0 output
+            # artefacts (.gfa / .fasta) are *copied* (not moved) into
+            # default_assembly/ after evaluation so the on-disk binaries remain
+            # in place for subsequent trials.
             if trial_id == 0:
-                base_name = "default_assembly"
+                base_name = "trial_assembly"
 
                 # Choose suffix based on inputs
                 if self.hic1 and self.hic2:
@@ -197,24 +270,46 @@ class ObjectiveBuilder:
                     max_kocc = trial.suggest_int("max_kocc", 1000, 5000, step=100)
 
                     command = build_hifiasm_command(
-                        x=x, y=y, s=s, n=n, m=m, p=p, u=u,
+                        x=x,
+                        y=y,
+                        s=s,
+                        n=n,
+                        m=m,
+                        p=p,
+                        u=u,
                         haploid_genome_size=self.haploid_genome_size,
                         threads=self.threads,
                         sensitive=True,
-                        D=D, N=N, max_kocc=max_kocc,
-                        hic1=self.hic1, hic2=self.hic2, ul=self.ul,
-                        **hic_params, **ont_params,
-                        primary=self.primary, ont=self.ont,
+                        D=D,
+                        N=N,
+                        max_kocc=max_kocc,
+                        hic1=self.hic1,
+                        hic2=self.hic2,
+                        ul=self.ul,
+                        **hic_params,
+                        **ont_params,
+                        primary=self.primary,
+                        ont=self.ont,
                     )
                 else:
                     command = build_hifiasm_command(
-                        x=x, y=y, s=s, n=n, m=m, p=p, u=u,
+                        x=x,
+                        y=y,
+                        s=s,
+                        n=n,
+                        m=m,
+                        p=p,
+                        u=u,
                         haploid_genome_size=self.haploid_genome_size,
                         threads=self.threads,
                         sensitive=False,
-                        hic1=self.hic1, hic2=self.hic2, ul=self.ul,
-                        **hic_params, **ont_params,
-                        primary=self.primary, ont=self.ont,
+                        hic1=self.hic1,
+                        hic2=self.hic2,
+                        ul=self.ul,
+                        **hic_params,
+                        **ont_params,
+                        primary=self.primary,
+                        ont=self.ont,
                     )
 
                 command += f" {self.input_reads}"
@@ -226,8 +321,18 @@ class ObjectiveBuilder:
                     log_filename="hifiasm.log",
                     command_name="hifiasm",
                     trial_id=trial_id,
-                    timeout_seconds=24 * 3600,
+                    timeout_seconds=self.trial_walltime_hours * 3600,
                 )
+
+                if return_code == 124:
+                    logging.warning(
+                        f"Trial {trial_id}: hifiasm exceeded the per-trial walltime "
+                        f"({self.trial_walltime_hours:.1f} h) and was killed. "
+                        "Consider increasing --trial-walltime or reducing --num-reads."
+                    )
+                    raise RuntimeError(
+                        f"Trial {trial_id} timed out after {self.trial_walltime_hours:.1f} h"
+                    )
 
                 if return_code != 0:
                     raise RuntimeError(f"Hifiasm failed - see {log_path}")
@@ -255,17 +360,38 @@ class ObjectiveBuilder:
                     for k, v in metrics.items():
                         trial.set_user_attr(k, float(v))
                 except Exception as e:
-                    logging.debug(f"Trial {trial_id}: failed to set metric user attrs: {e}")
+                    logging.debug(
+                        f"Trial {trial_id}: failed to set metric user attrs: {e}"
+                    )
 
-                # Save default assembly outputs to a dedicated folder
+                # Save trial 0 (default-parameter) assembly outputs to a
+                # dedicated folder so they survive subsequent trials that
+                # overwrite trial_assembly.* files. We *copy* rather than move
+                # because the working-directory copies — in particular the
+                # hifiasm intermediate binaries (.ec.bin, .ovlp.*.bin) — must
+                # remain in place so later trials can skip the costly read
+                # overlap computation.
                 if trial_id == 0:
                     default_dir = self.output_dir / "default_assembly"
                     default_dir.mkdir(parents=True, exist_ok=True)
-                    for f in Path(".").glob("default_assembly*"):
-                        if f.is_file():
-                            shutil.copy(str(f), default_dir / f.name)
+                    _copied = 0
+                    for f in Path(".").glob(f"{base_name}*"):
+                        try:
+                            # Don't recurse into the destination if it happens
+                            # to match the glob.
+                            if default_dir.resolve() in f.resolve().parents:
+                                continue
+                            if f.is_file():
+                                shutil.copy(str(f), default_dir / f.name)
+                                _copied += 1
+                        except Exception as _e:
+                            logging.warning(
+                                f"Could not copy {f} to default_assembly/: {_e}"
+                            )
                     logging.info(
-                        f"Default assembly results copied to {default_dir.resolve()}"
+                        f"Default assembly results copied to {default_dir.resolve()} "
+                        f"({_copied} file(s)). Working-directory copies preserved "
+                        "so hifiasm can reuse intermediate read-overlap caches."
                     )
 
                 # Return based on optimization mode
@@ -303,12 +429,16 @@ class ObjectiveBuilder:
                         trial.set_user_attr("aggregate_score", float(agg))
                         trial.set_user_attr("params", dict(trial.params))
                     except Exception as e:
-                        logging.debug(f"Trial {trial_id}: failed to set aggregate user attrs: {e}")
+                        logging.debug(
+                            f"Trial {trial_id}: failed to set aggregate user attrs: {e}"
+                        )
 
                     # Minimal logging: success and parameters
                     logging.info(
                         f"Trial {trial_id}: Completed successfully. Params: {dict(trial.params)}"
                     )
+                    # Emit raw (un-log-transformed) metric values for inspection
+                    self._log_raw_metrics(trial_id, metrics)
                     return objective_values
                 else:
                     # Single-objective: return weighted sum
@@ -324,7 +454,9 @@ class ObjectiveBuilder:
                         trial.set_user_attr("weighted_score", float(weighted_score))
                         trial.set_user_attr("params", dict(trial.params))
                     except Exception as e:
-                        logging.debug(f"Trial {trial_id}: failed to set weighted_score user attrs: {e}")
+                        logging.debug(
+                            f"Trial {trial_id}: failed to set weighted_score user attrs: {e}"
+                        )
 
                     # Log the weighted score and metric contributions
                     logging.info(
@@ -352,6 +484,13 @@ class ObjectiveBuilder:
                         else:
                             unknown_metrics.append((metric_name, metric_data))
 
+                    # Total of BUSCO/compleasm counts so we can also show
+                    # percentages for the four completeness metrics.
+                    total_busco = sum(
+                        self._reverse_log(metrics.get(k, 0))
+                        for k in self._BUSCO_KEYS
+                    )
+
                     def _log_block(title, items, denom_pos, denom_neg):
                         logging.info(title)
                         for metric_name, data in items:
@@ -367,25 +506,45 @@ class ObjectiveBuilder:
                                 share = 0.0
                                 share_label = "share"
 
+                            raw_str = self._format_raw_value(
+                                metric_name, data["log_value"], total_busco
+                            )
+
                             logging.info(
-                                f"  {metric_name:25s} | log_value: {data['log_value']:12.2f} | "
+                                f"  {metric_name:25s} | raw: {raw_str:>18s} | "
                                 f"weight: {data['weight']:6.2f} | "
                                 f"contribution: {contrib:9.4f} | "
                                 f"{share_label}: {share:6.2f}%"
                             )
 
-                    logging.info(f"\nTrial {trial_id} Metric Contributions (direction-aware):")
+                    logging.info(
+                        f"\nTrial {trial_id} Metric Contributions (direction-aware):"
+                    )
 
-                    _log_block("Maximize metrics (higher is better):", maximize_metrics, pos_sum, neg_sum)
-                    _log_block("Minimize metrics (lower is better):", minimize_metrics, pos_sum, neg_sum)
+                    _log_block(
+                        "Maximize metrics (higher is better):",
+                        maximize_metrics,
+                        pos_sum,
+                        neg_sum,
+                    )
+                    _log_block(
+                        "Minimize metrics (lower is better):",
+                        minimize_metrics,
+                        pos_sum,
+                        neg_sum,
+                    )
 
                     if unknown_metrics:
-                        _log_block("Unknown-direction metrics (check optim_directions.json):", unknown_metrics, pos_sum, neg_sum)
+                        _log_block(
+                            "Unknown-direction metrics (check optim_directions.json):",
+                            unknown_metrics,
+                            pos_sum,
+                            neg_sum,
+                        )
 
                     logging.info(
                         f"  {'TOTAL':25s} | Positive sum: {pos_sum:.4f} | Negative sum: {neg_sum:.4f}\n"
                     )
-
 
                     return weighted_score
 

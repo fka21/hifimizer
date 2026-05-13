@@ -19,9 +19,15 @@ def parse_genome_size(value: str) -> int:
     """
     raw = value.strip()
     suffixes = {
-        "gbp": 1_000, "gb": 1_000, "g": 1_000,
-        "mbp": 1,     "mb": 1,     "m": 1,
-        "kbp": 1e-3,  "kb": 1e-3,  "k": 1e-3,
+        "gbp": 1_000,
+        "gb": 1_000,
+        "g": 1_000,
+        "mbp": 1,
+        "mb": 1,
+        "m": 1,
+        "kbp": 1e-3,
+        "kb": 1e-3,
+        "k": 1e-3,
     }
 
     lower = raw.lower()
@@ -64,9 +70,7 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument(
-        "--version", action="version", version="%(prog)s 1.0.5"
-    )
+    parser.add_argument("--version", action="version", version="%(prog)s 1.0.7")
 
     # Required Inputs
     required = parser.add_argument_group("Required arguments")
@@ -172,6 +176,18 @@ def get_args():
         ),
     )
     optimization.add_argument(
+        "--trial-walltime",
+        type=float,
+        default=24.0,
+        metavar="HOURS",
+        help=(
+            "Maximum wall-clock time in hours allowed for a single hifiasm trial. "
+            "Trials that exceed this limit are killed, logged as timed-out, and pruned "
+            "from the Optuna study. The final assembly step uses the same limit. "
+            "Default: 24 hours."
+        ),
+    )
+    optimization.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -188,6 +204,10 @@ def get_args():
     optional_inputs.add_argument("--hic1", type=str, help="Hi-C R1 reads file")
     optional_inputs.add_argument("--hic2", type=str, help="Hi-C R2 reads file")
     optional_inputs.add_argument("--ul", type=str, help="Ultra-long ONT reads file")
-    optional_inputs.add_argument("--ont", action="store_true", help="Use this flag if as input you provide ONT R10 simplex reads.",)
+    optional_inputs.add_argument(
+        "--ont",
+        action="store_true",
+        help="Use this flag if as input you provide ONT R10 simplex reads.",
+    )
 
     return parser.parse_args()

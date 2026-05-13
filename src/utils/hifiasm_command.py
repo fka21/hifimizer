@@ -31,7 +31,7 @@ def build_hifiasm_command(
     path_min=None,
     primary=False,
     default_only=False,
-    ont=False
+    ont=False,
 ):
     """
     Constructs the hifiasm command string based on given parameters.
@@ -100,7 +100,8 @@ def run_default_hifiasm_assembly(
     hic2=None,
     ul=None,
     input_reads=None,
-    ont=False
+    ont=False,
+    logs_dir=None,
 ):
     """
     Run a clean hifiasm assembly with default parameters only.
@@ -116,7 +117,7 @@ def run_default_hifiasm_assembly(
                 hic2=hic2,
                 ul=ul,
                 default_only=True,
-                ont=ont
+                ont=ont,
             )
             + f" {input_reads}"
         )
@@ -127,8 +128,14 @@ def run_default_hifiasm_assembly(
     logger.info(f"Running clean hifiasm assembly with parameters:\n{command}")
 
     try:
-        subprocess_logger = SubprocessLogger(logs_dir=Path(prefix).parent / "logs")
-        return_code, log_path = subprocess_logger.run_command_with_logging(...)
+        subprocess_logger = SubprocessLogger(
+            logs_dir=logs_dir if logs_dir else Path(prefix).parent / "logs"
+        )
+        return_code, log_path = subprocess_logger.run_command_with_logging(
+            command=command,
+            log_filename="hifiasm.log",
+            command_name="hifiasm",
+        )
     except RuntimeError as e:
         logger.error(str(e))
         exit(1)

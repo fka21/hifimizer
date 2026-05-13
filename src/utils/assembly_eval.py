@@ -4,6 +4,7 @@ import json
 import subprocess
 import logging
 import random
+import shutil
 import gzip
 import numpy as np
 from pathlib import Path
@@ -271,6 +272,7 @@ class AssemblyEvaluator:
 
         except RuntimeError as e:
             self.logger.warning(f"Miniprot failed → retrying with MetaEuk: {e}")
+        
 
         # -----------------------------
         # 2. Fallback to metaeuk
@@ -300,6 +302,106 @@ class AssemblyEvaluator:
         results = self.parse_busco_results(busco_json_file)
 
         return results
+
+    def run_compleasm(
+        self, fasta_file, lineage="metazoa_odb12", download_path=None
+    ):
+        """
+        Run compleasm on the given FASTA assembly. Compleasm is a faster,
+        miniprot-based reimplementation of BUSCO that produces a compatible
+        completeness summary.
+
+        Args:
+            fasta_file (str): Path to the FASTA file.
+            lineage (str): Lineage name (e.g. 'metazoa_odb12'). The same
+                lineage strings as BUSCO are accepted.
+            download_path (str, optional): Path passed to compleasm's `-L`
+                flag. Compleasm expects to find (or will create) an
+                `mb_downloads/` subdirectory inside this path. If the path
+                does not contain a compleasm-format lineage, compleasm will
+                attempt to download it.
+
+        Returns:
+            dict: Log-transformed completeness counts with the same keys as
+                  ``run_busco`` (``single_copy``, ``multi_copy``,
+                  ``fragmented``, ``missing``).
+        """
+        output_dir = (
+            f"compleasm_output_{os.path.basename(fasta_file).split('.')[0]}"
+        )
+
+        # Remove any stale output directory from a previous attempt so
+        # compleasm doesn't refuse to write.
+        try:
+            if Path(output_dir).exists():
+                shutil.rmtree(output_dir)
+        except Exception as _e:
+            self.logger.debug(
+                f"Could not remove stale compleasm output {output_dir}: {_e}"
+            )
+
+        cmd = (
+            f"compleasm run -a {fasta_file} -o {output_dir} "
+            f"-l {lineage} -t {self.threads}"
+        )
+        if download_path:
+            cmd += f" -L {download_path}"
+
+        self.logger.info("Running compleasm")
+        self.run_command(self, cmd, "compleasm")
+
+        summary_file = Path(output_dir) / "summary.txt"
+        if not summary_file.exists():
+            raise FileNotFoundError(
+                f"Compleasm summary.txt not found at {summary_file}"
+            )
+
+        return self.parse_compleasm_summary(summary_file)
+
+    @staticmethod
+    def parse_compleasm_summary(summary_file):
+        """
+        Parse a compleasm summary.txt file and return BUSCO-compatible
+        log-transformed metric counts.
+
+        Expected format::
+
+            ## lineage: metazoa_odb12
+            S:61.46%, 413
+            D:26.19%, 176
+            F:3.72%, 25
+            M:8.63%, 58
+            N:672
+
+        S = single copy, D = duplicated (multi-copy), F = fragmented,
+        M = missing. The integer after the comma is the marker count
+        which we use (after log-transform) as the optimization metric,
+        matching the convention used for BUSCO.
+        """
+        # Compleasm sometimes emits "I" (incomplete) lines for certain
+        # lineages; we only consume the four canonical categories.
+        pattern = re.compile(
+            r"^\s*([SDFM])\s*:\s*[0-9.]+\s*%\s*,\s*(\d+)\s*$"
+        )
+        counts = {"S": 0, "D": 0, "F": 0, "M": 0}
+
+        with open(summary_file, "r") as f:
+            for line in f:
+                m = pattern.match(line)
+                if m:
+                    counts[m.group(1)] = int(m.group(2))
+
+        if all(v == 0 for v in counts.values()):
+            raise ValueError(
+                f"Could not parse any S/D/F/M counts from {summary_file}"
+            )
+
+        return {
+            "single_copy": np.log(counts["S"] + 1),
+            "multi_copy": np.log(counts["D"] + 1),
+            "fragmented": np.log(counts["F"] + 1),
+            "missing": np.log(counts["M"] + 1),
+        }
 
 
     def parse_gfastats_output(self, output):
@@ -331,69 +433,49 @@ class AssemblyEvaluator:
         return metrics
 
     def run_minimap2_align(self, fasta_file, reads_file, sam_file, threads=None):
-        """
-        Align reads to the assembly with minimap2.
-
-        Args:
-            fasta_file (str): Path to the FASTA assembly.
-            reads_file (str): Path to the reads (FASTQ).
-            sam_file (str): Desired output SAM file.
-            threads (int, optional): Number of CPU threads. If not provided, use self.threads.
-
-        Raises:
-            RuntimeError: If minimap2 exits with a non-zero code.
-        """
         threads = threads or self.threads
         reads_id = os.path.basename(reads_file)
-
-        # -----------------------------
-        # 1. Determine preset
-        # -----------------------------
         preset = self._get_minimap2_preset()
+        
+        mm2_cmd = f"minimap2 -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
+        mm2plus_cmd = f"mm2plus -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
 
-        # -----------------------------
-        # 2. Commands
-        # -----------------------------
-        mm2_cmd = (
-            f"minimap2 -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
-        )
-
-        mm2plus_cmd = (
-            f"mm2plus -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
-        )
-
-        # -----------------------------
-        # 3. Load / init aligner cache
-        # -----------------------------
         if not hasattr(self, "aligner_cache"):
             self.aligner_cache = self.backend_cache.get("aligner", {})
 
-        preferred = self.aligner_cache.get(reads_id, "mm2plus")
+        # Proactively check availability — don't rely solely on exception handling
+        mm2plus_available = shutil.which("mm2plus") is not None
+        if not mm2plus_available:
+            self.logger.info("mm2plus not found on PATH, using minimap2 directly")
 
-        # -----------------------------
-        # 4. Execution logic
-        # -----------------------------
-        if preferred == "minimap2":
-            self.run_command(self, mm2_cmd, "minimap2")
-            return sam_file
+        preferred = self.aligner_cache.get(
+            reads_id, "mm2plus" if mm2plus_available else "minimap2"
+        )
 
+        # Direct minimap2 path (either cached or mm2plus unavailable)
+        if preferred == "minimap2" or not mm2plus_available:
+            try:
+                self.run_command(self, mm2_cmd, "minimap2")
+                return sam_file
+            except RuntimeError as e:
+                self.logger.error(f"minimap2 failed: {e}")
+                raise
+
+        # Try mm2plus with minimap2 fallback
         try:
             self.run_command(self, mm2plus_cmd, "mm2plus")
             return sam_file
-
         except RuntimeError as e:
             self.logger.warning(f"[FALLBACK] mm2plus failed → minimap2 ({e})")
+            try:
+                self.run_command(self, mm2_cmd, "minimap2")
+            except RuntimeError as e2:
+                self.logger.error(f"Both mm2plus and minimap2 failed: {e2}")
+                raise
 
-            # fallback
-            self.run_command(self, mm2_cmd, "minimap2")
-
-            # -----------------------------
-            # 5. Persist failure
-            # -----------------------------
             self.aligner_cache[reads_id] = "minimap2"
             self.backend_cache["aligner"] = self.aligner_cache
             self._save_backend_cache()
-
             return sam_file
 
     def convert_sam_to_bam(self, sam_file, bam_file=None, threads=None):
@@ -768,20 +850,44 @@ class AssemblyEvaluator:
             metrics_sniffles = self.run_sniffles2(sorted_bam_file)
             combined_metrics.update(metrics_sniffles)
 
-            # Stage 7: BUSCO evaluation (optional)
+            # Stage 7: completeness evaluation (optional).
+            # Compleasm is preferred — it is a faster miniprot-based
+            # reimplementation of BUSCO with a compatible output schema.
+            # If compleasm fails for any reason (binary missing, lineage
+            # download failure, parsing error, …) we transparently fall
+            # back to the original BUSCO pipeline.
             if include_busco:
-                self.logger.info("Running BUSCO evaluation")
-                metrics_busco = self.run_busco(
-                    fasta_file, lineage=busco_lineage, download_path=self.download_path
-                )
-                combined_metrics.update(metrics_busco)
+                metrics_completeness = None
+                try:
+                    self.logger.info("Running compleasm evaluation")
+                    metrics_completeness = self.run_compleasm(
+                        fasta_file,
+                        lineage=busco_lineage,
+                        download_path=self.download_path,
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"Compleasm evaluation failed ({e}); "
+                        "falling back to BUSCO."
+                    )
+
+                if metrics_completeness is None:
+                    self.logger.info("Running BUSCO evaluation (fallback)")
+                    metrics_completeness = self.run_busco(
+                        fasta_file,
+                        lineage=busco_lineage,
+                        download_path=self.download_path,
+                    )
+
+                combined_metrics.update(metrics_completeness)
 
             # Return raw metrics dict for multicriteria optimization
             return combined_metrics
 
         except Exception as e:
             stage_info = self._get_current_stage(e)
-            self.logger.error(f"Assembly evaluation failed at stage: {stage_info}")
+            self.logger.error(f"Assembly evaluation failed at stage: {stage_info}", exc_info=True)
+            raise
 
     def cleanup_intermediate_files(self, trial_id=None):
         """
@@ -801,6 +907,7 @@ class AssemblyEvaluator:
                 "subset_reads.*",  # Subsetted reads (can be regenerated)
                 "sniffles_output_*.vcf",  # Trial-specific sniffles VCF files
                 "busco_output_trial_assembly/*",  # Trial BUSCO outputs
+                "compleasm_output_trial_assembly*",  # Trial compleasm outputs
             ]
 
             removed_count = 0
@@ -847,7 +954,7 @@ class AssemblyEvaluator:
             return "Assembly statistics"
         elif "sniffles" in error_str or "sv" in error_str:
             return "Structural variant detection"
-        elif "busco" in error_str:
-            return "BUSCO evaluation"
+        elif "busco" in error_str or "compleasm" in error_str:
+            return "BUSCO/compleasm evaluation"
         else:
             return "Unknown stage"

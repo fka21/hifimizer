@@ -13,6 +13,7 @@ from utils.optuna_callback import MultiCriteriaConvergenceDetector
 from utils.hifiasm_command import build_hifiasm_command, run_default_hifiasm_assembly
 from utils.objective import ObjectiveBuilder
 from utils.argparser import get_args
+from utils.subprocess_logger import SubprocessLogger
 
 # Set the base path to the current working directory
 base_path = Path.cwd()
@@ -72,7 +73,9 @@ if hic2:
 if ul:
     _input_files["--ul"] = ul
 
-_missing = [f"{flag}: {path}" for flag, path in _input_files.items() if not path.exists()]
+_missing = [
+    f"{flag}: {path}" for flag, path in _input_files.items() if not path.exists()
+]
 if _missing:
     logging.error("Input file(s) not found:\n  " + "\n  ".join(_missing))
     sys.exit(1)
@@ -106,7 +109,7 @@ evaluator = AssemblyEvaluator(
     threads=threads,
     download_path=download_path,
     logs_dir=logs_dir,
-    ont=args.ont
+    ont=args.ont,
 )
 
 if args.default_hifiasm:
@@ -119,32 +122,35 @@ if args.default_hifiasm:
         hic2=args.hic2,
         ul=args.ul,
         input_reads=input_reads,
-        ont=args.ont
+        ont=args.ont,
     )
     exit(0)
 
 # --- Dry-run: validate tools and print trial-0 command, then exit ---
 if args.dry_run:
     import shutil as _shutil
+
     _required_tools = ["hifiasm", "busco", "gfastats"]
     _missing_tools = [t for t in _required_tools if _shutil.which(t) is None]
     if _missing_tools:
         logging.error(
-            "Dry-run: required tool(s) not found on PATH: "
-            + ", ".join(_missing_tools)
+            "Dry-run: required tool(s) not found on PATH: " + ", ".join(_missing_tools)
         )
         sys.exit(1)
 
-    _dry_cmd = build_hifiasm_command(
-        prefix="trial_assembly",
-        haploid_genome_size=KNOWN_GENOME_SIZE,
-        threads=threads,
-        primary=args.primary,
-        hic1=hic1,
-        hic2=hic2,
-        ul=ul,
-        ont=args.ont,
-    ) + f" {input_reads}"
+    _dry_cmd = (
+        build_hifiasm_command(
+            prefix="trial_assembly",
+            haploid_genome_size=KNOWN_GENOME_SIZE,
+            threads=threads,
+            primary=args.primary,
+            hic1=hic1,
+            hic2=hic2,
+            ul=ul,
+            ont=args.ont,
+        )
+        + f" {input_reads}"
+    )
 
     logging.info(
         "Dry-run checks passed.\n"
@@ -165,6 +171,7 @@ def busco_lineage_exists(download_path, lineage):
     return download_path and os.path.exists(
         os.path.join(download_path, "lineages", lineage)
     )
+
 
 if download_path and busco_lineage_exists(download_path, args.busco_lineage):
     logging.info(
@@ -205,7 +212,9 @@ def convergence_callback(study, trial):
     if current is None:
         current = trial.user_attrs.get("aggregate_score", None)
     if current is None:
-        logging.warning(f"Trial {trial.number} has no usable score for convergence → skipping")
+        logging.warning(
+            f"Trial {trial.number} has no usable score for convergence → skipping"
+        )
         return
 
     has_converged, converged_methods = convergence_detector.update(
@@ -248,6 +257,7 @@ def best_tracker_callback(study, trial):
             params = trial.user_attrs.get("params", dict(trial.params))
             try:
                 import json as _json
+
                 checkpoint = {
                     "trial": trial.number,
                     "score": float(score_val),
@@ -256,7 +266,9 @@ def best_tracker_callback(study, trial):
                 with open(output_dir / "best_params_checkpoint.json", "w") as _f:
                     _json.dump(checkpoint, _f, indent=2)
             except Exception as cp_err:
-                logging.debug(f"best_tracker_callback: checkpoint write failed: {cp_err}")
+                logging.debug(
+                    f"best_tracker_callback: checkpoint write failed: {cp_err}"
+                )
             logging.info(
                 f"New best so far: trial {trial.number} score={score_val:.4f} params={params}"
             )
@@ -455,7 +467,9 @@ try:
             sys.exit(1)
 
         if len(study.trials) == 0:
-            logging.error("No trials found in the existing study. Cannot rerun best assembly.")
+            logging.error(
+                "No trials found in the existing study. Cannot rerun best assembly."
+            )
             sys.exit(1)
 
         # ---- Locate best trial (mirrors post-optimisation logic below) ----
@@ -491,7 +505,9 @@ try:
             sys.exit(1)
 
         _converged_methods = study.user_attrs.get("converged_methods", [])
-        _methods_str = ", ".join(_converged_methods) if _converged_methods else "unknown"
+        _methods_str = (
+            ", ".join(_converged_methods) if _converged_methods else "unknown"
+        )
         logging.info(
             f"\n{'#' * 60}\n"
             f"--rerun-best mode\n"
@@ -519,10 +535,21 @@ try:
                 ont=args.ont,
             )
             for _key in [
-                "x", "y", "s", "n", "m", "p", "u",
-                "D", "N", "max_kocc",
-                "s_base", "f_perturb", "l_msjoin",
-                "path_max", "path_min",
+                "x",
+                "y",
+                "s",
+                "n",
+                "m",
+                "p",
+                "u",
+                "D",
+                "N",
+                "max_kocc",
+                "s_base",
+                "f_perturb",
+                "l_msjoin",
+                "path_max",
+                "path_min",
             ]:
                 if _key in _best_params:
                     _hifiasm_kwargs[_key] = _best_params[_key]
@@ -548,8 +575,7 @@ try:
 
         if _rc != 0:
             logging.error(
-                f"--rerun-best: hifiasm exited with code {_rc}. "
-                f"See log at {_log_path}"
+                f"--rerun-best: hifiasm exited with code {_rc}. See log at {_log_path}"
             )
             sys.exit(1)
 
@@ -594,18 +620,20 @@ try:
             def _rev_log(v):
                 return max(0, np.exp(v) - 1) if v else 0
 
-            _num_contigs   = int(_rev_log(_metrics.get("num_contigs", 0)))
-            _n50           = int(_rev_log(_metrics.get("n50", 0)))
-            _num_sv        = int(_rev_log(_metrics.get("num_sv", 0)))
-            _error_rate    =     _rev_log(_metrics.get("error_rate", 0))
-            _length_diff   =     _rev_log(_metrics.get("length_diff", 0))
-            _single_copy   = int(_rev_log(_metrics.get("single_copy", 0)))
-            _multi_copy    = int(_rev_log(_metrics.get("multi_copy", 0)))
-            _fragmented    = int(_rev_log(_metrics.get("fragmented", 0)))
-            _missing       = int(_rev_log(_metrics.get("missing", 0)))
+            _num_contigs = int(_rev_log(_metrics.get("num_contigs", 0)))
+            _n50 = int(_rev_log(_metrics.get("n50", 0)))
+            _num_sv = int(_rev_log(_metrics.get("num_sv", 0)))
+            _error_rate = _rev_log(_metrics.get("error_rate", 0))
+            _length_diff = _rev_log(_metrics.get("length_diff", 0))
+            _single_copy = int(_rev_log(_metrics.get("single_copy", 0)))
+            _multi_copy = int(_rev_log(_metrics.get("multi_copy", 0)))
+            _fragmented = int(_rev_log(_metrics.get("fragmented", 0)))
+            _missing = int(_rev_log(_metrics.get("missing", 0)))
 
             _total_busco = _single_copy + _multi_copy + _fragmented + _missing
-            def _pct(x): return (x / _total_busco * 100) if _total_busco > 0 else 0
+
+            def _pct(x):
+                return (x / _total_busco * 100) if _total_busco > 0 else 0
 
             logging.info(
                 "Rerun assembly metrics:\n"
@@ -806,8 +834,8 @@ else:
         if len(study.best_params) >= 2:
             fig = vis.plot_contour(study)
             fig.write_html(optuna_dir / "contour.html")
-            
-    # Per-metric histories (same spirit as multi-objective)
+
+        # Per-metric histories (same spirit as multi-objective)
         metric_dir = optuna_dir / "metrics"
         metric_dir.mkdir(parents=True, exist_ok=True)
 
@@ -861,7 +889,7 @@ try:
             hic1=hic1,
             hic2=hic2,
             ul=ul,
-            ont=args.ont
+            ont=args.ont,
         )
 
         # copy relevant optimized parameters if present
@@ -895,8 +923,6 @@ try:
             final_cmd = None
 
         if final_cmd:
-            from utils.subprocess_logger import SubprocessLogger
-
             runner = SubprocessLogger(logs_dir=logs_dir)
             logging.info(f"Running final assembly with best params: {final_cmd}")
             try:

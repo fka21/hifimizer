@@ -327,6 +327,7 @@ dependencies:
   - pyparsing=3.2.2
   - pyside6=6.8.2
   - pysocks=1.7.1
+  - pytest
   - python=3.10.16
   - python-dateutil=2.9.0.post0
   - python-tzdata=2025.2
