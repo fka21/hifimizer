@@ -13,7 +13,6 @@ from utils.optuna_callback import MultiCriteriaConvergenceDetector
 from utils.hifiasm_command import build_hifiasm_command, run_default_hifiasm_assembly
 from utils.objective import ObjectiveBuilder
 from utils.argparser import get_args
-from utils.subprocess_logger import SubprocessLogger
 
 # Set the base path to the current working directory
 base_path = Path.cwd()
@@ -123,6 +122,7 @@ if args.default_hifiasm:
         ul=args.ul,
         input_reads=input_reads,
         ont=args.ont,
+        logs_dir=logs_dir,
     )
     exit(0)
 
@@ -200,6 +200,7 @@ objective_builder = ObjectiveBuilder(
     logs_dir=logs_dir,
     is_multi_objective=args.multi_objective,
     ont=args.ont,
+    trial_walltime_hours=args.trial_walltime,
 )
 # Build the objective function
 objective = objective_builder.build_objective()
@@ -449,6 +450,14 @@ try:
             f"Resuming existing study with {len(study.trials)} trials. Use --force-rerun to start fresh."
         )
 
+    # --rerun-trial / --rerun-best mutual exclusion guard
+    if getattr(args, "rerun_trial", None) is not None and args.rerun_best:
+        logging.error("--rerun-trial and --rerun-best are mutually exclusive.")
+        sys.exit(1)
+    if getattr(args, "rerun_trial", None) is not None and args.force_rerun:
+        logging.error("--rerun-trial and --force-rerun are mutually exclusive.")
+        sys.exit(1)
+
     # --rerun-best: skip optimisation entirely and immediately rerun the best
     # assembly found in a previously converged study.
     if args.rerun_best:
@@ -456,15 +465,28 @@ try:
             logging.error("--rerun-best and --force-rerun are mutually exclusive.")
             sys.exit(1)
 
-        # Gate on recorded convergence so users cannot accidentally rerun a
-        # study that never finished properly.
-        if not study.user_attrs.get("converged", False):
+        # Gate: require either a recorded convergence flag OR a stored best_trial
+        # (written by best_tracker_callback).  The latter handles studies from older
+        # hifimizer versions that ran single-objective optimisation without attaching
+        # the convergence callback and therefore never set study.user_attrs["converged"].
+        _study_converged = study.user_attrs.get("converged", False)
+        _study_has_best = study.user_attrs.get("best_trial", None) is not None
+
+        if not _study_converged and not _study_has_best:
             logging.error(
-                "--rerun-best requested but no convergence was recorded for this "
-                "study. Run the full optimisation first and ensure it converges "
-                "before using --rerun-best."
+                "--rerun-best requested but neither a convergence flag nor a stored "
+                "best_trial was found in this study. Run the full optimisation first "
+                "and ensure it completes before using --rerun-best."
             )
             sys.exit(1)
+
+        if not _study_converged and _study_has_best:
+            logging.warning(
+                "--rerun-best: no explicit convergence flag found in this study "
+                "(likely produced by an older hifimizer version that did not run the "
+                "convergence callback for single-objective optimisation). "
+                "Proceeding with the best recorded trial anyway."
+            )
 
         if len(study.trials) == 0:
             logging.error(
@@ -519,12 +541,15 @@ try:
         )
 
         # ---- Build and run final assembly with best params ----
+        # Use the trial's own prefix so hifiasm reuses pre-existing bin files,
+        # then rename outputs to final_assembly.* afterwards.
+        _rerun_trial_prefix = f"trial_assembly_{_rerun_best_trial.number}"
         try:
             _best_params = _rerun_best_trial.user_attrs.get(
                 "params", dict(_rerun_best_trial.params)
             )
             _hifiasm_kwargs = dict(
-                prefix="final_assembly",
+                prefix=_rerun_trial_prefix,
                 haploid_genome_size=KNOWN_GENOME_SIZE,
                 threads=threads,
                 sensitive=args.sensitive,
@@ -559,7 +584,9 @@ try:
             logging.error(f"--rerun-best: failed to build hifiasm command: {_e}")
             sys.exit(1)
 
-        logging.info(f"Running final assembly:\n{_final_cmd}")
+        logging.info(
+            f"Running final assembly (bin-reuse prefix '{_rerun_trial_prefix}'):\n{_final_cmd}"
+        )
         _runner = SubprocessLogger(logs_dir=logs_dir)
         try:
             _rc, _log_path = _runner.run_command_with_logging(
@@ -567,10 +594,18 @@ try:
                 log_filename="hifiasm.log",
                 command_name="hifiasm",
                 trial_id="rerun_best",
-                timeout_seconds=24 * 3600,
+                timeout_seconds=args.trial_walltime * 3600,
             )
         except Exception as _e:
             logging.error(f"--rerun-best: hifiasm run failed: {_e}")
+            sys.exit(1)
+
+        if _rc == 124:
+            logging.error(
+                f"--rerun-best: hifiasm exceeded the walltime limit "
+                f"({args.trial_walltime:.1f} h) and was killed. "
+                "Re-run with a larger --trial-walltime value."
+            )
             sys.exit(1)
 
         if _rc != 0:
@@ -578,6 +613,25 @@ try:
                 f"--rerun-best: hifiasm exited with code {_rc}. See log at {_log_path}"
             )
             sys.exit(1)
+
+        # Rename trial_assembly_N.* → final_assembly.*
+        import shutil as _shutil_rb
+
+        _cwd_rb = Path.cwd()
+        _renamed_rb = 0
+        for _rbsrc in sorted(_cwd_rb.glob(f"{_rerun_trial_prefix}*")):
+            _rbsuffix = _rbsrc.name[len(_rerun_trial_prefix) :]
+            _rbdst = _cwd_rb / f"final_assembly{_rbsuffix}"
+            try:
+                _rbsrc.rename(_rbdst)
+                _renamed_rb += 1
+            except Exception as _re:
+                logging.warning(
+                    f"--rerun-best: could not rename {_rbsrc.name} → {_rbdst.name}: {_re}"
+                )
+        logging.info(
+            f"--rerun-best: renamed {_renamed_rb} file(s) from '{_rerun_trial_prefix}.*' to 'final_assembly.*'"
+        )
 
         # ---- Locate the GFA produced by the rerun ----
         # Suffix mirrors objective.py's suffix selection logic
@@ -652,6 +706,205 @@ try:
 
         sys.exit(0)
     # ---- end --rerun-best ----
+
+    # --rerun-trial N: skip optimisation and rerun a specific trial number.
+    if getattr(args, "rerun_trial", None) is not None:
+        _trial_num = args.rerun_trial
+
+        if len(study.trials) == 0:
+            logging.error("No trials found in the existing study. Cannot rerun trial.")
+            sys.exit(1)
+
+        # Locate the requested trial
+        _target_trial = None
+        for _t in study.trials:
+            if _t.number == _trial_num:
+                _target_trial = _t
+                break
+
+        if _target_trial is None:
+            _available = [t.number for t in study.trials]
+            logging.error(
+                f"Trial {_trial_num} not found in the existing study. "
+                f"Available trial numbers: {_available}"
+            )
+            sys.exit(1)
+
+        score_key = "aggregate_score" if args.multi_objective else "weighted_score"
+        _trial_score = _target_trial.user_attrs.get(score_key, float("-inf"))
+        _trial_params = _target_trial.user_attrs.get(
+            "params", dict(_target_trial.params)
+        )
+
+        logging.info(
+            f"\n{'#' * 60}\n"
+            f"--rerun-trial mode\n"
+            f"Trial               : {_trial_num}\n"
+            f"Score ({score_key:>16}): {_trial_score:.4f}\n"
+            f"Params              : {_trial_params}\n"
+            f"{'#' * 60}"
+        )
+
+        # Build and run hifiasm using trial's own prefix so existing bin files are reused
+        _trial_prefix = f"trial_assembly_{_trial_num}"
+        try:
+            _rt_kwargs = dict(
+                prefix=_trial_prefix,
+                haploid_genome_size=KNOWN_GENOME_SIZE,
+                threads=threads,
+                sensitive=args.sensitive,
+                primary=args.primary,
+                hic1=hic1,
+                hic2=hic2,
+                ul=ul,
+                ont=args.ont,
+            )
+            for _key in [
+                "x",
+                "y",
+                "s",
+                "n",
+                "m",
+                "p",
+                "u",
+                "D",
+                "N",
+                "max_kocc",
+                "s_base",
+                "f_perturb",
+                "l_msjoin",
+                "path_max",
+                "path_min",
+            ]:
+                if _key in _trial_params:
+                    _rt_kwargs[_key] = _trial_params[_key]
+
+            _rt_cmd = build_hifiasm_command(**_rt_kwargs) + f" {input_reads}"
+        except Exception as _e:
+            logging.error(f"--rerun-trial: failed to build hifiasm command: {_e}")
+            sys.exit(1)
+
+        logging.info(
+            f"Running trial {_trial_num} assembly (bin-reuse prefix '{_trial_prefix}'):\n{_rt_cmd}"
+        )
+        _rt_runner = SubprocessLogger(logs_dir=logs_dir)
+        try:
+            _rt_rc, _rt_log = _rt_runner.run_command_with_logging(
+                command=_rt_cmd,
+                log_filename="hifiasm.log",
+                command_name="hifiasm",
+                trial_id=f"rerun_trial_{_trial_num}",
+                timeout_seconds=args.trial_walltime * 3600,
+            )
+        except Exception as _e:
+            logging.error(f"--rerun-trial: hifiasm run failed: {_e}")
+            sys.exit(1)
+
+        if _rt_rc == 124:
+            logging.error(
+                f"--rerun-trial: hifiasm exceeded the walltime limit "
+                f"({args.trial_walltime:.1f} h) and was killed. "
+                "Re-run with a larger --trial-walltime value."
+            )
+            sys.exit(1)
+
+        if _rt_rc != 0:
+            logging.error(
+                f"--rerun-trial: hifiasm exited with code {_rt_rc}. "
+                f"See log at {_rt_log}"
+            )
+            sys.exit(1)
+
+        # Rename all trial_assembly_N.* files → final_assembly.*
+        import shutil as _shutil_rt
+
+        _cwd = Path.cwd()
+        _renamed = 0
+        for _src in sorted(_cwd.glob(f"{_trial_prefix}*")):
+            _suffix = _src.name[len(_trial_prefix) :]
+            _dst = _cwd / f"final_assembly{_suffix}"
+            try:
+                _src.rename(_dst)
+                _renamed += 1
+            except Exception as _re:
+                logging.warning(
+                    f"--rerun-trial: could not rename {_src.name} → {_dst.name}: {_re}"
+                )
+        logging.info(
+            f"--rerun-trial: renamed {_renamed} file(s) from '{_trial_prefix}.*' to 'final_assembly.*'"
+        )
+
+        # Determine GFA suffix (mirrors objective.py logic)
+        if hic1 and hic2:
+            _rt_suffix = "hic.hap1.p_ctg"
+        elif ul:
+            _rt_suffix = "bp.hap1.p_ctg"
+        else:
+            _rt_suffix = "bp.p_ctg"
+
+        _rt_gfa_candidates = list(_cwd.glob(f"final_assembly*.{_rt_suffix}.gfa"))
+        if not _rt_gfa_candidates:
+            logging.error(
+                f"--rerun-trial: no GFA file matching 'final_assembly*.{_rt_suffix}.gfa' "
+                "found after renaming."
+            )
+            sys.exit(1)
+
+        _rt_gfa = str(_rt_gfa_candidates[0])
+        _rt_fasta = str(Path(_rt_gfa).with_suffix(".fasta"))
+
+        try:
+            AssemblyEvaluator.convert_gfa_to_fasta(_rt_gfa, _rt_fasta)
+            logging.info(f"Generated FASTA from GFA: {_rt_fasta}")
+        except Exception as _e:
+            logging.warning(f"--rerun-trial: failed to convert GFA to FASTA: {_e}")
+
+        logging.info(f"Evaluating rerun assembly: {_rt_gfa}")
+        try:
+            evaluator.trial_id = f"rerun_trial_{_trial_num}"
+            _rt_metrics = evaluator.evaluate_assembly(
+                gfa_file=_rt_gfa,
+                fasta_file=_rt_fasta,
+                include_busco=args.include_busco,
+                busco_lineage=args.busco_lineage,
+                download_path=download_path,
+            )
+
+            def _rev_log_rt(v):
+                return max(0, np.exp(v) - 1) if v else 0
+
+            _rt_num_contigs = int(_rev_log_rt(_rt_metrics.get("num_contigs", 0)))
+            _rt_n50 = int(_rev_log_rt(_rt_metrics.get("n50", 0)))
+            _rt_num_sv = int(_rev_log_rt(_rt_metrics.get("num_sv", 0)))
+            _rt_error_rate = _rev_log_rt(_rt_metrics.get("error_rate", 0))
+            _rt_length_diff = _rev_log_rt(_rt_metrics.get("length_diff", 0))
+            _rt_single = int(_rev_log_rt(_rt_metrics.get("single_copy", 0)))
+            _rt_multi = int(_rev_log_rt(_rt_metrics.get("multi_copy", 0)))
+            _rt_frag = int(_rev_log_rt(_rt_metrics.get("fragmented", 0)))
+            _rt_missing = int(_rev_log_rt(_rt_metrics.get("missing", 0)))
+
+            _rt_total = _rt_single + _rt_multi + _rt_frag + _rt_missing
+
+            def _rt_pct(x):
+                return (x / _rt_total * 100) if _rt_total > 0 else 0
+
+            logging.info(
+                f"Trial {_trial_num} rerun assembly metrics:\n"
+                f"  - Number of contigs          : {_rt_num_contigs}\n"
+                f"  - Length difference          : {_rt_length_diff:.2f} Mb\n"
+                f"  - N50                        : {_rt_n50} bp\n"
+                f"  - Mapping error rate         : {_rt_error_rate:.6f}\n"
+                f"  - Large-scale misassemblies  : {_rt_num_sv}\n"
+                f"  - Single-copy BUSCOs         : {_rt_pct(_rt_single):.2f}%\n"
+                f"  - Multi-copy BUSCOs          : {_rt_pct(_rt_multi):.2f}%\n"
+                f"  - Fragmented BUSCOs          : {_rt_pct(_rt_frag):.2f}%\n"
+                f"  - Missing BUSCOs             : {_rt_pct(_rt_missing):.2f}%"
+            )
+        except Exception as _e:
+            logging.error(f"--rerun-trial: assembly evaluation failed: {_e}")
+
+        sys.exit(0)
+    # ---- end --rerun-trial ----
 
     mode_str = (
         "multi-objective"
@@ -879,9 +1132,12 @@ try:
         except Exception:
             best_params = dict(best_trial.params)
 
-        # Build hifiasm command for final assembly
+        # Build hifiasm command for final assembly.
+        # Use the same prefix as a normal trial run so hifiasm reuses the
+        # pre-existing overlap bin files, then rename the outputs afterwards.
+        _final_trial_prefix = f"trial_assembly_{best_trial.number}"
         hifiasm_kwargs = dict(
-            prefix="final_assembly",
+            prefix=_final_trial_prefix,
             haploid_genome_size=KNOWN_GENOME_SIZE,
             threads=threads,
             sensitive=args.sensitive,
@@ -923,21 +1179,53 @@ try:
             final_cmd = None
 
         if final_cmd:
+            from utils.subprocess_logger import SubprocessLogger
+
             runner = SubprocessLogger(logs_dir=logs_dir)
-            logging.info(f"Running final assembly with best params: {final_cmd}")
+            logging.info(
+                f"Running final assembly with best params (bin-reuse prefix '{_final_trial_prefix}'): {final_cmd}"
+            )
             try:
                 rc, log_path = runner.run_command_with_logging(
                     command=final_cmd,
                     log_filename="hifiasm.log",
                     command_name="hifiasm",
                     trial_id="best",
-                    timeout_seconds=24 * 3600,
+                    timeout_seconds=args.trial_walltime * 3600,
                 )
             except Exception as e:
                 logging.error(f"Final hifiasm run failed: {e}")
                 rc = -1
 
+            if rc == 124:
+                logging.error(
+                    f"Final hifiasm assembly exceeded the walltime limit "
+                    f"({args.trial_walltime:.1f} h) and was killed. "
+                    "Re-run with --rerun-best and a larger --trial-walltime value."
+                )
+
             if rc == 0:
+                # Rename trial_assembly_N.* → final_assembly.* so downstream
+                # tools always find a consistent "final_assembly" prefix.
+                import shutil as _shutil_final
+
+                _cwd_final = Path.cwd()
+                _renamed_final = 0
+                for _fsrc in sorted(_cwd_final.glob(f"{_final_trial_prefix}*")):
+                    _fsuffix = _fsrc.name[len(_final_trial_prefix) :]
+                    _fdst = _cwd_final / f"final_assembly{_fsuffix}"
+                    try:
+                        _fsrc.rename(_fdst)
+                        _renamed_final += 1
+                    except Exception as _re:
+                        logging.warning(
+                            f"Final assembly rename: could not rename {_fsrc.name} → {_fdst.name}: {_re}"
+                        )
+                logging.info(
+                    f"Renamed {_renamed_final} file(s) from '{_final_trial_prefix}.*' "
+                    "to 'final_assembly.*'"
+                )
+
                 # Find generated GFA file(s) for final assembly
                 gfa_candidates = list(Path.cwd().glob("final_assembly*.bp.p_ctg.gfa"))
                 if not gfa_candidates:

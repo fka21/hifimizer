@@ -70,7 +70,7 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--version", action="version", version="%(prog)s 1.0.7")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.0.5")
 
     # Required Inputs
     required = parser.add_argument_group("Required arguments")
@@ -173,6 +173,16 @@ def get_args():
             "Skip optimization and rerun hifiasm using the best parameters recorded in an "
             "existing study. Requires that the previous run reached convergence. "
             "Incompatible with --force-rerun."
+        ),
+    )
+    optimization.add_argument(
+        "--rerun-trial",
+        type=int,
+        default=None,
+        metavar="TRIAL_NUM",
+        help=(
+            "Skip optimization and rerun hifiasm using the parameters of a specific trial "
+            "number from an existing study. Incompatible with --force-rerun and --rerun-best."
         ),
     )
     optimization.add_argument(

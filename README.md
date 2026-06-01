@@ -115,8 +115,9 @@ usage: hifimizer.py [-h] [--version] --genome-size GENOME_SIZE --input-reads
                     [--no-busco] [--busco-lineage BUSCO_LINEAGE]
                     [--multi-objective] [--default-hifiasm] [--primary]
                     [--force-rerun] [--dry-run] [--rerun-best]
-                    [--trial-walltime HOURS] [--seed SEED] [--hic1 HIC1]
-                    [--hic2 HIC2] [--ul UL] [--ont]
+                    [--rerun-trial TRIAL_NUM] [--trial-walltime HOURS]
+                    [--seed SEED] [--hic1 HIC1] [--hic2 HIC2] [--ul UL]
+                    [--ont]
 
 Optimize hifiasm de novo genome assemblies with Optuna. Supports parameter
 optimization for standard HiFi, Hi-C, and ultra-long ONT assemblies. By
@@ -190,6 +191,11 @@ Optimization options:
                         parameters recorded in an existing study. Requires
                         that the previous run reached convergence.
                         Incompatible with --force-rerun. (default: False)
+  --rerun-trial TRIAL_NUM
+                        Skip optimization and rerun hifiasm using the
+                        parameters of a specific trial number from an existing
+                        study. Incompatible with --force-rerun and --rerun-
+                        best. (default: None)
   --trial-walltime HOURS
                         Maximum wall-clock time in hours allowed for a single
                         hifiasm trial. Trials that exceed this limit are
