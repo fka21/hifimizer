@@ -41,7 +41,7 @@ class AssemblyEvaluator:
         threads=None,
         download_path=None,
         logs_dir=None,
-        ont=False
+        ont=False,
     ):
         self.known_genome_size = known_genome_size
         self.input_reads = input_reads
@@ -68,7 +68,7 @@ class AssemblyEvaluator:
         self._compile_patterns()
         # Load metric weights from config (or use defaults)
         self.weights = self._load_weights()
-        
+
         # Caches regarding busco gene prediction tool used
         self.cache_path = Path("busco_backend_cache.json")
         self.backend_cache = self._load_backend_cache()
@@ -79,7 +79,9 @@ class AssemblyEvaluator:
                 with open(self.cache_path) as f:
                     return json.load(f)
             except Exception:
-                self.logger.warning("Failed to load BUSCO backend cache, starting fresh")
+                self.logger.warning(
+                    "Failed to load BUSCO backend cache, starting fresh"
+                )
         return {}
 
     def _save_backend_cache(self):
@@ -88,9 +90,6 @@ class AssemblyEvaluator:
                 json.dump(self.backend_cache, f, indent=2)
         except Exception as e:
             self.logger.warning(f"Failed to save BUSCO backend cache: {e}")
-            
-    def _get_minimap2_preset(self):
-        return "map-ont" if self.ont else "map-hifi"
 
     def _compile_patterns(self):
         """
@@ -237,16 +236,30 @@ class AssemblyEvaluator:
         return True
 
     def run_busco(
-        self, fasta_file, lineage="metazoa_odb12", mode="genome", download_path=None
+        self,
+        fasta_file,
+        lineage="metazoa_odb12",
+        mode="genome",
+        download_path=None,
+        walltime="6h",
     ):
         """
         Run BUSCO on the given FASTA assembly.
+
+        Tries MetaEuk first and falls back to Augustus if MetaEuk fails.
+        Each attempt is capped at `walltime` using the GNU `timeout` utility,
+        so a hung gene-prediction step is killed instead of blocking forever.
+
+        If both backends fail (or exceed the walltime), the program exits and
+        logs that the user should re-run with BUSCO disabled.
 
         Args:
             fasta_file (str): Path to the FASTA file.
             lineage (str): BUSCO lineage dataset.
             mode (str): BUSCO mode ('genome', 'proteins', etc.).
             download_path (str, optional): Custom path to BUSCO datasets.
+            walltime (str): Max wall-clock time per BUSCO attempt, in GNU
+                `timeout` format (e.g. "6h", "360m"). Set to None to disable.
 
         Returns:
             dict: Parsed BUSCO metrics.
@@ -261,30 +274,45 @@ class AssemblyEvaluator:
         if download_path:
             base_cmd += f" --download_path {download_path}"
 
+        # Wrap each attempt in `timeout` so a stuck process is hard-killed.
+        # -k 1m sends SIGKILL one minute after the initial SIGTERM if the
+        # process is still alive.
+        timeout_prefix = f"timeout -k 1m {walltime} " if walltime else ""
+
         # -----------------------------
-        # 1. Try miniprot (default)
+        # 1. Try MetaEuk (default)
         # -----------------------------
+        cmd_metaeuk = timeout_prefix + base_cmd + " --metaeuk"
         try:
-            self.logger.info("Running BUSCO with miniprot")
-            self.run_command(self, base_cmd, "busco_miniprot")
-            backend_used = "miniprot"
+            self.logger.info(f"Running BUSCO with MetaEuk (walltime: {walltime})")
+            self.run_command(self, cmd_metaeuk, "busco_metaeuk")
+            backend_used = "metaeuk"
 
         except RuntimeError as e:
-            self.logger.warning(f"Miniprot failed → retrying with MetaEuk: {e}")
+            self.logger.warning(
+                f"MetaEuk failed or exceeded walltime → retrying with Augustus: {e}"
+            )
 
-        # -----------------------------
-        # 2. Fallback to metaeuk
-        # -----------------------------
-            cmd_metaeuk = base_cmd + " --metaeuk"
-
+            # -----------------------------
+            # 2. Fallback to Augustus
+            # -----------------------------
+            cmd_augustus = timeout_prefix + base_cmd + " --augustus"
             try:
-                self.run_command(self, cmd_metaeuk, "busco_metaeuk")
-                backend_used = "metaeuk"
+                self.logger.info(f"Running BUSCO with Augustus (walltime: {walltime})")
+                self.run_command(self, cmd_augustus, "busco_augustus")
+                backend_used = "augustus"
 
             except RuntimeError:
-                self.logger.error("BUSCO failed with both miniprot and metaeuk")
-                raise
-            
+                self.logger.critical(
+                    "BUSCO failed or exceeded the %s walltime with both MetaEuk and "
+                    "Augustus. This usually means a gene-prediction step is hanging or "
+                    "broken in this environment. Re-run with BUSCO disabled (the "
+                    "skip-BUSCO flag, i.e. include_busco=False) to proceed without "
+                    "completeness scoring. Exiting.",
+                    walltime,
+                )
+                sys.exit(1)
+
         # -----------------------------
         # Parse output (unchanged)
         # -----------------------------
@@ -300,7 +328,6 @@ class AssemblyEvaluator:
         results = self.parse_busco_results(busco_json_file)
 
         return results
-
 
     def parse_gfastats_output(self, output):
         """
@@ -349,14 +376,12 @@ class AssemblyEvaluator:
         # -----------------------------
         # 1. Determine preset
         # -----------------------------
-        preset = self._get_minimap2_preset()
+        preset = "map-ont" if self.ont else "map-hifi"
 
         # -----------------------------
         # 2. Commands
         # -----------------------------
-        mm2_cmd = (
-            f"minimap2 -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
-        )
+        mm2_cmd = f"minimap2 -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
 
         mm2plus_cmd = (
             f"mm2plus -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
@@ -744,7 +769,11 @@ class AssemblyEvaluator:
             # Stage 2: Read alignment
             self.logger.info("Running minimap2 alignment")
             aln_file = self.run_minimap2_align(
-                fasta_file, self.subset_reads, self.aln_file, threads=self.threads
+                fasta_file,
+                self.subset_reads,
+                self.aln_file,
+                threads=self.threads,
+                ont=self.ont,
             )
 
             # Stage 3: Parse alignment stats
