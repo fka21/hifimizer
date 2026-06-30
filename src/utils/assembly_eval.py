@@ -3,6 +3,7 @@ import re
 import json
 import subprocess
 import logging
+import sys
 import random
 import gzip
 import numpy as np
@@ -769,11 +770,7 @@ class AssemblyEvaluator:
             # Stage 2: Read alignment
             self.logger.info("Running minimap2 alignment")
             aln_file = self.run_minimap2_align(
-                fasta_file,
-                self.subset_reads,
-                self.aln_file,
-                threads=self.threads,
-                ont=self.ont,
+                fasta_file, self.subset_reads, self.aln_file, threads=self.threads
             )
 
             # Stage 3: Parse alignment stats
