@@ -1,7 +1,7 @@
 import logging
-import subprocess
-from utils.subprocess_logger import SubprocessLogger
 from pathlib import Path
+
+from utils.subprocess_logger import SubprocessLogger
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,8 @@ def build_hifiasm_command(
     path_min=None,
     primary=False,
     default_only=False,
-    ont=False
+    ont=False,
+    hom_cov=None,
 ):
     """
     Constructs the hifiasm command string based on given parameters.
@@ -57,9 +58,22 @@ def build_hifiasm_command(
     if primary:
         cmd += "--primary "
 
+    if hom_cov is not None:
+        cmd += f"--hom-cov {hom_cov} "
+
+    if ont:
+        cmd += "--ont "
+
+    if hic1 and hic2:
+        cmd += f"--h1 {hic1} --h2 {hic2} "
+
+    if ul:
+        cmd += f"--ul {ul} "
+
     if default_only:
         return cmd.strip()
 
+    # --- tunable parameters ----------------------------------------------
     if not None in [x, y, s, n, m, p]:
         cmd += f"-x {x} -y {y} -s {s} -n {n} -m {m} -p {p} "
 
@@ -67,7 +81,6 @@ def build_hifiasm_command(
         cmd += f"-u {u} "
 
     if hic1 and hic2:
-        cmd += f"--h1 {hic1} --h2 {hic2} "
         if s_base is not None:
             cmd += f"--s-base {s_base} "
         if f_perturb is not None:
@@ -76,7 +89,6 @@ def build_hifiasm_command(
             cmd += f"--l-msjoin {l_msjoin} "
 
     if ul:
-        cmd += f"--ul {ul} "
         if path_max is not None:
             cmd += f"--path-max {path_max} "
         if path_min is not None:
@@ -85,8 +97,6 @@ def build_hifiasm_command(
     if sensitive:
         if not None in [D, N, max_kocc]:
             cmd += f"-D {D} -N {N} --max-kocc {max_kocc} "
-    if ont:
-        cmd += f"--ont"
 
     return cmd.strip()
 
@@ -102,6 +112,8 @@ def run_default_hifiasm_assembly(
     input_reads=None,
     ont=False,
     logs_dir=None,
+    hom_cov=None,
+    walltime_hours=None,
 ):
     """
     Run a clean hifiasm assembly with default parameters only.
@@ -117,7 +129,8 @@ def run_default_hifiasm_assembly(
                 hic2=hic2,
                 ul=ul,
                 default_only=True,
-                ont=ont
+                ont=ont,
+                hom_cov=hom_cov,
             )
             + f" {input_reads}"
         )
@@ -128,14 +141,24 @@ def run_default_hifiasm_assembly(
     logger.info(f"Running clean hifiasm assembly with parameters:\n{command}")
 
     try:
-        subprocess_logger = SubprocessLogger(logs_dir=logs_dir if logs_dir else Path(prefix).parent / "logs")
+        subprocess_logger = SubprocessLogger(
+            logs_dir=logs_dir if logs_dir else Path(prefix).parent / "logs"
+        )
         return_code, log_path = subprocess_logger.run_command_with_logging(
             command=command,
             log_filename="hifiasm.log",
             command_name="hifiasm",
+            timeout_seconds=walltime_hours * 3600 if walltime_hours else None,
         )
     except RuntimeError as e:
         logger.error(str(e))
+        exit(1)
+
+    if return_code == 124:
+        logger.error(
+            f"Default hifiasm run exceeded the walltime limit ({walltime_hours} h) "
+            f"and was killed. Check log at {log_path}"
+        )
         exit(1)
 
     if return_code == 0:

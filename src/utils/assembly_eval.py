@@ -1,78 +1,131 @@
 import os
 import re
 import json
+import shutil
 import subprocess
 import logging
-import sys
-import random
 import gzip
+import random
 import numpy as np
 from pathlib import Path
 from Bio import SeqIO
-from utils.subprocess_logger import SubprocessLogger
+
+from utils.subprocess_logger import SubprocessLogger, TIMEOUT_EXIT_CODE
+from utils.paths import RunPaths
+
+
+class BuscoFailedError(RuntimeError):
+    """Raised when every BUSCO gene-prediction backend fails or times out."""
 
 
 class AssemblyEvaluator:
     """
-    AssemblyEvaluator provides a unified interface to evaluate and optimize genome assemblies.
+    AssemblyEvaluator provides a unified interface to evaluate genome assemblies.
 
     It integrates:
-    - Assembly evaluation with `gfastats`
-    - Read-to-assembly alignment and evaluation using `gfalign`
-    - Completeness scoring with `BUSCO`
+    - Assembly statistics with `gfastats`
+    - Reference-free error detection with `CRAQ` (clip-based CRE/CSE, AQI)
+    - Structural-variant counting with `sniffles2`, reusing CRAQ's alignment
+    - Gene-space completeness with `BUSCO`
+    - k-mer completeness and consensus QV with `yak`
 
-    The metrics gathered from these steps are parsed and scored with predefined weights to guide optimization routines
-    (e.g., Optuna) in search of parameter configurations that produce the best assemblies.
+    All intermediate artefacts are written beneath ``paths.work_dir``; nothing
+    is written relative to the current working directory.
 
-    Attributes:
-        known_genome_size (int): Known genome size to compare against.
-        input_reads (str): Path to the full input reads.
-        subset_reads (str): Path to the subsetted reads file.
-        aln_file (str): Alignment file produced by gfalign.
-        db_path (str): Path to the SQLite database used for Optuna studies.
-        db_uri (str): Full SQLite URI to the study database.
-        threads (int): Number of threads to use in BUSCO and gfalign.
+    Metric conventions
+    ------------------
+    Every metric except those listed in :attr:`RAW_METRICS` is stored
+    log-transformed as ``log(value + 1)``.  ``qv`` (already a Phred-scaled,
+    i.e. logarithmic, quantity) and ``kmer_completeness`` (a bounded
+    percentage) are stored raw: log-transforming them would compress their
+    variance to the point of invisibility next to ``n50``.
     """
+
+    #: metrics that are NOT log-transformed
+    RAW_METRICS = frozenset(
+        {
+            "qv",
+            "kmer_completeness",
+            "aqi",
+            "r_aqi",
+            "s_aqi",
+            "cre_per_mb",
+            "cse_per_mb",
+            "craq_covered_rate",
+            "craq_low_conf_rate",
+        }
+    )
 
     def __init__(
         self,
         known_genome_size,
         input_reads,
+        paths: RunPaths,
         trial_id=None,
         threads=None,
         download_path=None,
-        logs_dir=None,
         ont=False,
+        busco_walltime_hours=6.0,
+        craq_walltime_hours=6.0,
+        craq_mapq=20,
+        kmer_eval=True,
+        yak_k=31,
+        yak_bloom_bits=37,
     ):
+        """
+        Args:
+            known_genome_size: Haploid genome size in base pairs.
+            input_reads: Path to the full input read set.
+            paths: :class:`RunPaths` instance describing the run layout.
+            trial_id: Optuna trial number (or a string like "best").
+            threads: CPU threads handed to the external tools.
+            download_path: User-supplied BUSCO dataset directory. When None,
+                ``paths.busco_downloads_dir`` is used.
+            ont: Input reads are ONT (selects the CRAQ/minimap2 preset).
+            busco_walltime_hours: Wall-clock budget per BUSCO backend attempt.
+            craq_walltime_hours: Wall-clock budget for the CRAQ run.
+            craq_mapq: Minimum mapping quality passed to CRAQ (-q).
+            kmer_eval: Enable the yak QV / k-mer completeness metrics.
+        """
         self.known_genome_size = known_genome_size
-        self.input_reads = input_reads
-        self.number_reads = 1000
-        self.subset_reads = "subset_reads.fa"
-        self.aln_file = "alignment.sam"
-        self.db_path = "optuna_study.db"
-        self.db_uri = f"sqlite:///{self.db_path}"
+        self.input_reads = Path(input_reads)
+        self.paths = paths
         self.trial_id = trial_id
         self.threads = threads
         self.ont = ont
-        self.download_path = download_path
-        self._compile_patterns()
+        self.busco_walltime_hours = busco_walltime_hours
+        self.craq_walltime_hours = craq_walltime_hours
+        self.craq_mapq = craq_mapq
+        self.kmer_eval = kmer_eval
+        self.yak_k = yak_k
+        self.yak_bloom_bits = yak_bloom_bits
 
-        # Initialize subprocess logger with provided logs_dir
-        self.subprocess_logger = SubprocessLogger(
-            logs_dir=logs_dir if logs_dir else Path.cwd() / "logs"
+        # BUSCO datasets: user override, else our own work/ subdirectory.
+        self.download_path = (
+            Path(download_path).resolve()
+            if download_path
+            else paths.busco_downloads_dir
         )
 
-        # Initialize main logger for this evaluator
+        self.subprocess_logger = SubprocessLogger(logs_dir=paths.logs_dir)
         self.logger = logging.getLogger(f"AssemblyEval_{trial_id or 'main'}")
 
-        # Compile regex patterns for parsing outputs
         self._compile_patterns()
-        # Load metric weights from config (or use defaults)
         self.weights = self._load_weights()
 
-        # Caches regarding busco gene prediction tool used
-        self.cache_path = Path("busco_backend_cache.json")
+        # Cache of which backend (aligner, BUSCO gene predictor) actually works
+        # in this environment, so a failing one is only paid for once.
+        self.cache_path = paths.busco_backend_cache
         self.backend_cache = self._load_backend_cache()
+
+    # ------------------------------------------------------------------ misc
+    @property
+    def subset_reads(self) -> Path:
+        return self.paths.subset_reads
+
+    @property
+    def trial_dir(self) -> Path:
+        return self.paths.trial_dir(self.trial_id)
 
     def _load_backend_cache(self):
         if self.cache_path.exists():
@@ -87,39 +140,39 @@ class AssemblyEvaluator:
 
     def _save_backend_cache(self):
         try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.cache_path, "w") as f:
                 json.dump(self.backend_cache, f, indent=2)
         except Exception as e:
-            self.logger.warning(f"Failed to save BUSCO backend cache: {e}")
+            self.logger.warning(f"Failed to save backend cache: {e}")
 
     def _compile_patterns(self):
-        """
-        Pre-compile regular expression patterns for parsing output of evaluation tools.
-        """
+        """Pre-compile regexes for parsing the output of the evaluation tools."""
         self.gfastats_patterns = {
             "num_contigs": re.compile(r"# contigs:\s+(\d+)"),
             "length_diff": re.compile(r"Total contig length:\s+(\d+)"),
             "n50": re.compile(r"Contig N50:\s+(\d+)"),
         }
 
-        self.stats_patterns = {
-            "reads_mapped": re.compile(r"reads mapped:\s+(\d+)"),
-            "error_rate": re.compile(
-                r"error rate:\s+([0-9]+\.?[0-9]*([eE][-+]?[0-9]+)?)"
-            ),
-            "supplementary_alignments": re.compile(
-                r"supplementary alignments:\s+(\d+)"
-            ),
-        }
+        # CRAQ's short report puts the per-metric AQI in parentheses, e.g.
+        # "0.312(94.221)" for "Avg.CRE(R-AQI)".
+        self.craq_value_paren = re.compile(r"^([-+0-9.eE]+)\(([-+0-9.eE]+)\)$")
 
-        self.sniffles_patterns = {
-            "num_sv": re.compile(r"Total SVs:\s+(\d+)"),
-        }
-
-    @staticmethod
-    def run_command(self, command, command_name="command"):
+    def run_command(
+        self, command, command_name="command", timeout_seconds=None, cwd=None
+    ):
         """
-        Run a command with logging - updated to use subprocess logger.
+        Run a command through the subprocess logger.
+
+        Args:
+            command: Shell command string.
+            command_name: Used for the log filename and error messages.
+            timeout_seconds: Wall-clock limit; on expiry the whole process
+                group is killed and a TimeoutError is raised.
+            cwd: Working directory for the command.
+
+        Returns:
+            Tuple of (log_file_contents, "", return_code)
         """
         try:
             return_code, log_path = self.subprocess_logger.run_command_with_logging(
@@ -127,75 +180,69 @@ class AssemblyEvaluator:
                 log_filename=f"{command_name}.log",
                 command_name=command_name,
                 trial_id=self.trial_id,
+                timeout_seconds=timeout_seconds,
+                cwd=cwd,
             )
+
+            if return_code == TIMEOUT_EXIT_CODE:
+                self.logger.error(
+                    f"{command_name} exceeded its walltime and was killed. "
+                    f"See log: {log_path}"
+                )
+                raise TimeoutError(
+                    f"{command_name} timed out after {timeout_seconds} s "
+                    f"- see {log_path}"
+                )
 
             if return_code != 0:
                 self.logger.error(
-                    f"{command_name} failed (return code: {return_code}). See log: {log_path}"
+                    f"{command_name} failed (return code: {return_code}). "
+                    f"See log: {log_path}"
                 )
                 raise RuntimeError(f"{command_name} failed - see {log_path}")
 
-            # For compatibility, return stdout from log file
             with open(log_path, "r") as f:
                 content = f.read()
 
             return content, "", return_code
 
+        except (RuntimeError, TimeoutError):
+            raise
         except Exception as e:
             self.logger.error(f"Command execution failed: {e}")
             raise
 
+    # ------------------------------------------------------------------ setup
     def download_busco(self, lineage="metazoa_odb12"):
-        """
-        Download the BUSCO lineage dataset if not already present.
-
-        Args:
-            lineage (str): BUSCO lineage name.
-        """
-        busco_dir = Path(f"busco_downloads/{lineage}")
-        if busco_dir.exists():
-            self.logger.info("BUSCO dataset already downloaded. Skipping download.")
-            return
-        try:
-            command = f"busco --download {lineage}"
-            return self.run_command(
-                self, command=command, command_name="busco_download"
+        """Download the BUSCO lineage dataset into the work/ tree if absent."""
+        lineage_dir = self.download_path / "lineages" / lineage
+        if lineage_dir.exists():
+            self.logger.info(
+                f"BUSCO lineage '{lineage}' already present in {self.download_path}. "
+                "Skipping download."
             )
+            return
+
+        self.download_path.mkdir(parents=True, exist_ok=True)
+        command = f"busco --download_path {self.download_path} --download {lineage}"
+        try:
+            return self.run_command(command, command_name="busco_download")
         except Exception as e:
             self.logger.error(f"BUSCO download failed: {e}")
             raise
 
-    def run_gfastats(self, gfa_file):
+    def read_subsetting(self, num_reads):
         """
-        Run gfastats on the given GFA file.
+        Subsample ``num_reads`` reads from the input file into
+        ``work/reads/subset_reads.fa``.
 
-        Args:
-            gfa_file (str): Path to GFA file.
-
-        Returns:
-            dict: Parsed gfastats metrics.
+        The subset is always written as FASTA regardless of input format: the
+        downstream consumers (CRAQ/minimap2, sniffles) do not use base
+        qualities, and a fixed filename keeps every trial pointing at the same
+        file.
         """
-        command = f"gfastats --discover-paths {gfa_file}"
-        try:
-            stdout, _, _ = self.run_command(self, command, "gfastats")
-            return self.parse_gfastats_output(stdout)
-        except RuntimeError:
-            self.logger.error("Gfastats analysis failed")
-            raise
-
-    def read_subsetting(self, num_reads=None):
-        """
-        Subsample reads from the input FASTA/FASTQ file and write to subset_reads.
-
-        Args:
-            num_reads (int): Number of reads to sample.
-        """
-        # Initialize number of reads if not provided, and get input file name
         fname = self.input_reads.name
-        if num_reads is None:
-            num_reads = self.number_reads
 
-        # Determine file format
         if fname.endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz")):
             fmt = "fastq"
         elif fname.endswith((".fasta", ".fa", ".fasta.gz", ".fa.gz")):
@@ -207,417 +254,492 @@ class AssemblyEvaluator:
 
         open_func = gzip.open if fname.endswith(".gz") else open
 
-        # Read and sample records
         with open_func(self.input_reads, "rt") as handle:
             records = list(SeqIO.parse(handle, fmt))
         sampled = random.sample(records, min(num_reads, len(records)))
 
-        # Write sampled reads
-        output_is_gz = str(self.subset_reads).endswith(".gz")
-        open_func_out = gzip.open if output_is_gz else open
+        self.subset_reads.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.subset_reads, "wt") as out_handle:
+            SeqIO.write(sampled, out_handle, "fasta")
 
-        with open_func_out(self.subset_reads, "wt") as out_handle:
-            SeqIO.write(sampled, out_handle, fmt)
-
-    @staticmethod
-    def convert_gfa_to_fasta(gfa_file, output_fasta):
-        """
-        Convert GFA file to FASTA format.
-
-        Args:
-            gfa_file (_type_): _description_
-            output_fasta (_type_): _description_
-
-        Returns:
-            _type_: _description_
-        """
-        command = ["awk", '$1 == "S" {print ">"$2"\\n"$3}', gfa_file]
-        with open(output_fasta, "w") as out_file:
-            subprocess.run(command, stdout=out_file, check=True)
-        return True
-
-    def run_busco(
-        self,
-        fasta_file,
-        lineage="metazoa_odb12",
-        mode="genome",
-        download_path=None,
-        walltime="6h",
-    ):
-        """
-        Run BUSCO on the given FASTA assembly.
-
-        Tries MetaEuk first and falls back to Augustus if MetaEuk fails.
-        Each attempt is capped at `walltime` using the GNU `timeout` utility,
-        so a hung gene-prediction step is killed instead of blocking forever.
-
-        If both backends fail (or exceed the walltime), the program exits and
-        logs that the user should re-run with BUSCO disabled.
-
-        Args:
-            fasta_file (str): Path to the FASTA file.
-            lineage (str): BUSCO lineage dataset.
-            mode (str): BUSCO mode ('genome', 'proteins', etc.).
-            download_path (str, optional): Custom path to BUSCO datasets.
-            walltime (str): Max wall-clock time per BUSCO attempt, in GNU
-                `timeout` format (e.g. "6h", "360m"). Set to None to disable.
-
-        Returns:
-            dict: Parsed BUSCO metrics.
-        """
-        output_dir = f"busco_output_{os.path.basename(fasta_file).split('.')[0]}"
-
-        base_cmd = (
-            f"busco -i {fasta_file} -l {lineage} -m {mode} -o {output_dir} "
-            f"-c {self.threads} --skip_bbtools --force"
+        self.logger.info(
+            f"Wrote {len(sampled)} subsampled reads to {self.subset_reads}"
         )
 
-        if download_path:
-            base_cmd += f" --download_path {download_path}"
-
-        # Wrap each attempt in `timeout` so a stuck process is hard-killed.
-        # -k 1m sends SIGKILL one minute after the initial SIGTERM if the
-        # process is still alive.
-        timeout_prefix = f"timeout -k 1m {walltime} " if walltime else ""
-
-        # -----------------------------
-        # 1. Try MetaEuk (default)
-        # -----------------------------
-        cmd_metaeuk = timeout_prefix + base_cmd + " --metaeuk"
-        try:
-            self.logger.info(f"Running BUSCO with MetaEuk (walltime: {walltime})")
-            self.run_command(self, cmd_metaeuk, "busco_metaeuk")
-            backend_used = "metaeuk"
-
-        except RuntimeError as e:
-            self.logger.warning(
-                f"MetaEuk failed or exceeded walltime → retrying with Augustus: {e}"
-            )
-
-            # -----------------------------
-            # 2. Fallback to Augustus
-            # -----------------------------
-            cmd_augustus = timeout_prefix + base_cmd + " --augustus"
-            try:
-                self.logger.info(f"Running BUSCO with Augustus (walltime: {walltime})")
-                self.run_command(self, cmd_augustus, "busco_augustus")
-                backend_used = "augustus"
-
-            except RuntimeError:
-                self.logger.critical(
-                    "BUSCO failed or exceeded the %s walltime with both MetaEuk and "
-                    "Augustus. This usually means a gene-prediction step is hanging or "
-                    "broken in this environment. Re-run with BUSCO disabled (the "
-                    "skip-BUSCO flag, i.e. include_busco=False) to proceed without "
-                    "completeness scoring. Exiting.",
-                    walltime,
-                )
-                sys.exit(1)
-
-        # -----------------------------
-        # Parse output (unchanged)
-        # -----------------------------
-        out_dir_path = Path(output_dir)
-        matches = list(out_dir_path.glob(f"short_summary.specific.{lineage}.*.json"))
-        if not matches:
-            matches = list(out_dir_path.glob("short_summary.*.json"))
-        if not matches:
-            raise FileNotFoundError(f"BUSCO summary JSON not found in {output_dir}")
-
-        busco_json_file = str(matches[0])
-
-        results = self.parse_busco_results(busco_json_file)
-
-        return results
-
-    def parse_gfastats_output(self, output):
+    # ------------------------------------------------------------------- yak
+    def build_read_kmer_db(self, force=False):
         """
-        Parse gfastats output and extract relevant metrics.
+        Build the yak k-mer hash table for the *full* read set, once.
 
-        Args:
-            output (str): Raw gfastats stdout output.
+        The read hash is a property of the reads, not of any assembly, so it is
+        built during setup and reused by every trial.
+
+        Command (see https://github.com/lh3/yak):
+            yak count -k31 -b37 -t<threads> -o reads.yak <reads>
+
+        ``-b37`` uses a Bloom filter to discard singleton k-mers, which is what
+        lh3 recommends for high-coverage read sets and keeps memory bounded.
+        """
+        if not self.kmer_eval:
+            return None
+
+        if self.paths.reads_yak.exists() and not force:
+            self.logger.info(
+                f"yak read hash already present at {self.paths.reads_yak}; "
+                "skipping `yak count`."
+            )
+            return self.paths.reads_yak
+
+        self.paths.reads_yak.parent.mkdir(parents=True, exist_ok=True)
+        bloom = f"-b{self.yak_bloom_bits} " if self.yak_bloom_bits else ""
+        command = (
+            f"yak count -k{self.yak_k} {bloom}"
+            f"-t{self.threads} -o {self.paths.reads_yak} {self.input_reads}"
+        )
+        self.logger.info(f"Building yak read k-mer hash: {command}")
+        try:
+            self.run_command(command, command_name="yak_count")
+        except Exception as e:
+            self.logger.error(
+                f"yak count failed: {e}. k-mer metrics will be unavailable; "
+                "re-run with --no-kmer-eval to silence this."
+            )
+            self.kmer_eval = False
+            return None
+
+        return self.paths.reads_yak
+
+    @staticmethod
+    def parse_yak_qv(qv_file):
+        """
+        Parse the output of ``yak qv``.
+
+        yak writes tab-separated records (see main.c in lh3/yak):
+
+            CT  <occ>  <read_kmer_count>  <asm_kmer_count>  <adjusted_count>
+            FR  <fpr_lower>  <fpr_upper>
+            ER  <total_input_kmers>  <adjusted_error_kmers>
+            CV  <cov>
+            QV  <qv_raw>  <qv_adjusted>
+
+        ``CV`` is the fraction of read k-mers at the modal occurrence that are
+        found in the assembly, i.e. a k-mer completeness estimate in [0, 1].
+
+        ``QV`` carries two values: the naive estimate and the model-calibrated
+        one.  yak sets the calibrated value to -1 when the read histogram is
+        too shallow to fit the model (``max_c <= 4``), in which case we fall
+        back to the raw estimate.
 
         Returns:
-            dict: Dictionary of raw gfastats metrics.
+            dict with ``qv`` (Phred) and ``kmer_completeness`` (percent).
         """
+        qv_raw = qv_adj = cov = None
+
+        with open(qv_file, "r") as fh:
+            for line in fh:
+                fields = line.rstrip("\n").split("\t")
+                if not fields:
+                    continue
+                tag = fields[0]
+                try:
+                    if tag == "CV" and len(fields) >= 2:
+                        cov = float(fields[1])
+                    elif tag == "QV" and len(fields) >= 3:
+                        qv_raw = float(fields[1])
+                        qv_adj = float(fields[2])
+                except ValueError:
+                    continue
+
+        # Prefer the calibrated QV; -1 means yak declined to calibrate.
+        if qv_adj is not None and qv_adj > 0:
+            qv = qv_adj
+        elif qv_raw is not None and qv_raw > 0:
+            qv = qv_raw
+        else:
+            qv = 0.0
+
+        completeness = (cov * 100.0) if cov and cov > 0 else 0.0
+        # CV is a ratio of estimates and can marginally exceed 1.0.
+        completeness = min(completeness, 100.0)
+
+        return {"qv": float(qv), "kmer_completeness": float(completeness)}
+
+    def _combine_fastas(self, fasta_files, out_path):
+        with open(out_path, "wb") as out:
+            for f in fasta_files:
+                with open(f, "rb") as fh:
+                    shutil.copyfileobj(fh, out)
+        return out_path
+
+    def run_yak_qv(self, fasta_file, extra_fasta_files=None):
+        """
+        Compute consensus QV and k-mer completeness with ``yak qv``.
+
+        Command:
+            yak qv -t<threads> -K<chunk> reads.yak asm.fa > yak_qv.txt
+
+        ``-p`` (per-sequence QV) is deliberately omitted: it adds one line per
+        contig to stdout and we only consume the whole-assembly summary.
+
+        QV is measured on ``fasta_file`` alone, because it is a per-haplotype
+        base-accuracy statistic.  k-mer completeness is measured on the union
+        of ``fasta_file`` and ``extra_fasta_files`` (i.e. hap1 + hap2), because
+        completeness of a single haplotype is structurally capped by
+        heterozygosity: scoring hap1 alone rewards collapsed assemblies.
+        """
+        if not self.kmer_eval:
+            return {}
+
+        if not self.paths.reads_yak.exists():
+            self.logger.warning(
+                "yak read hash not found; skipping k-mer metrics for this trial."
+            )
+            return {}
+
+        tdir = self.trial_dir
+        # -K batches sequence loading; sizing it near the haploid genome length
+        # follows the `-K3.2g` example in the yak README.
+        chunk = max(100_000_000, int(self.known_genome_size))
+
+        # --- QV on the primary haplotype ---
+        qv_out = tdir / "yak_qv.primary.txt"
+        command = (
+            f"yak qv -t{self.threads} -K{chunk} "
+            f"{self.paths.reads_yak} {fasta_file} > {qv_out}"
+        )
+        self.run_command(command, command_name="yak_qv")
+        primary = self.parse_yak_qv(qv_out)
+
+        # --- completeness on the full (diploid) assembly ---
+        extra_fasta_files = [f for f in (extra_fasta_files or []) if Path(f).exists()]
+        if extra_fasta_files:
+            combined = self._combine_fastas(
+                [fasta_file] + list(extra_fasta_files), tdir / "combined_haps.fasta"
+            )
+            comb_out = tdir / "yak_qv.combined.txt"
+            command = (
+                f"yak qv -t{self.threads} -K{chunk * 2} "
+                f"{self.paths.reads_yak} {combined} > {comb_out}"
+            )
+            self.run_command(command, command_name="yak_qv_combined")
+            combined_stats = self.parse_yak_qv(comb_out)
+            primary["kmer_completeness"] = combined_stats["kmer_completeness"]
+            try:
+                combined.unlink()
+            except Exception:
+                pass
+
+        return primary
+
+    # ---------------------------------------------------------------- gfastats
+    def run_gfastats(self, gfa_file):
+        command = f"gfastats --discover-paths {gfa_file}"
+        try:
+            stdout, _, _ = self.run_command(command, "gfastats")
+            return self.parse_gfastats_output(stdout)
+        except RuntimeError:
+            self.logger.error("Gfastats analysis failed")
+            raise
+
+    def parse_gfastats_output(self, output):
         metrics = {}
         for key, pattern in self.gfastats_patterns.items():
             match = re.search(pattern, output)
             if match:
                 value = int(match.group(1))
                 if key == "length_diff":
-                    # Return raw difference in megabases
                     metrics[key] = np.log(
                         (abs(value - self.known_genome_size) / 1_000_000) + 1
                     )
-                elif key == "n50":
-                    # Return raw N50 value
-                    metrics[key] = np.log(value + 1)
                 else:
-                    # Return raw value
                     metrics[key] = np.log(value + 1)
         return metrics
 
-    def run_minimap2_align(self, fasta_file, reads_file, sam_file, threads=None):
+    @staticmethod
+    def convert_gfa_to_fasta(gfa_file, output_fasta):
+        """Extract the S-lines of a GFA into a FASTA file."""
+        command = ["awk", '$1 == "S" {print ">"$2"\\n"$3}', str(gfa_file)]
+        Path(output_fasta).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_fasta, "w") as out_file:
+            subprocess.run(command, stdout=out_file, check=True)
+        return True
+
+    # ------------------------------------------------------------------ BUSCO
+    #: attempted in order; the first that succeeds is cached for later trials
+    BUSCO_BACKENDS = ("miniprot", "metaeuk", "augustus")
+
+    def run_busco(self, fasta_file, lineage="metazoa_odb12", mode="genome"):
         """
-        Align reads to the assembly with minimap2.
+        Run BUSCO, trying gene-prediction backends in order of increasing cost.
 
-        Args:
-            fasta_file (str): Path to the FASTA assembly.
-            reads_file (str): Path to the reads (FASTQ).
-            sam_file (str): Desired output SAM file.
-            threads (int, optional): Number of CPU threads. If not provided, use self.threads.
+        Miniprot has been the default for eukaryotic genome mode since BUSCO
+        v5.7.0 and is typically minutes rather than hours; metaeuk and augustus
+        are only reached if it fails.  Whichever backend succeeds is recorded
+        in the backend cache so subsequent trials do not re-pay for the
+        failures.
 
-        Raises:
-            RuntimeError: If minimap2 exits with a non-zero code.
+        Each attempt is bounded by ``busco_walltime_hours``, enforced by
+        ``SubprocessLogger`` killing the whole process group.  GNU ``timeout``
+        is deliberately *not* used: it signals only the direct child, leaving
+        BUSCO's metaeuk/augustus/hmmsearch grandchildren running.
         """
-        threads = threads or self.threads
-        reads_id = os.path.basename(reads_file)
+        tdir = self.trial_dir
+        out_name = "busco_output"
+        out_dir = tdir / out_name
 
-        # -----------------------------
-        # 1. Determine preset
-        # -----------------------------
-        preset = "map-ont" if self.ont else "map-hifi"
-
-        # -----------------------------
-        # 2. Commands
-        # -----------------------------
-        mm2_cmd = f"minimap2 -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
-
-        mm2plus_cmd = (
-            f"mm2plus -t {threads} -ax {preset} -o {sam_file} {fasta_file} {reads_file}"
+        # BUSCO's -o must be a bare name; the location is set with --out_path.
+        base_cmd = (
+            f"busco -i {fasta_file} -l {lineage} -m {mode} "
+            f"-o {out_name} --out_path {tdir} "
+            f"-c {self.threads} --skip_bbtools --force "
+            f"--download_path {self.download_path}"
         )
 
-        # -----------------------------
-        # 3. Load / init aligner cache
-        # -----------------------------
-        if not hasattr(self, "aligner_cache"):
-            self.aligner_cache = self.backend_cache.get("aligner", {})
+        timeout_seconds = (
+            self.busco_walltime_hours * 3600 if self.busco_walltime_hours else None
+        )
 
-        preferred = self.aligner_cache.get(reads_id, "mm2plus")
+        cached = self.backend_cache.get("busco")
+        if cached in self.BUSCO_BACKENDS:
+            order = [cached] + [b for b in self.BUSCO_BACKENDS if b != cached]
+        else:
+            order = list(self.BUSCO_BACKENDS)
 
-        # -----------------------------
-        # 4. Execution logic
-        # -----------------------------
-        if preferred == "minimap2":
-            self.run_command(self, mm2_cmd, "minimap2")
-            return sam_file
+        last_error = None
+        backend_used = None
+        for backend in order:
+            cmd = f"{base_cmd} --{backend}"
+            try:
+                self.logger.info(
+                    f"Running BUSCO with {backend} "
+                    f"(walltime: {self.busco_walltime_hours} h)"
+                )
+                self.run_command(cmd, f"busco_{backend}", timeout_seconds=timeout_seconds)
+                backend_used = backend
+                break
+            except (RuntimeError, TimeoutError) as e:
+                last_error = e
+                self.logger.warning(
+                    f"BUSCO/{backend} failed or exceeded its walltime: {e}"
+                )
 
-        try:
-            self.run_command(self, mm2plus_cmd, "mm2plus")
-            return sam_file
+        if backend_used is None:
+            raise BuscoFailedError(
+                f"BUSCO failed or exceeded the {self.busco_walltime_hours} h walltime "
+                f"with every backend ({', '.join(order)}). This usually means a "
+                "gene-prediction step is hanging or broken in this environment. "
+                "Re-run with --no-busco to proceed without completeness scoring. "
+                f"Last error: {last_error}"
+            )
 
-        except RuntimeError as e:
-            self.logger.warning(f"[FALLBACK] mm2plus failed → minimap2 ({e})")
-
-            # fallback
-            self.run_command(self, mm2_cmd, "minimap2")
-
-            # -----------------------------
-            # 5. Persist failure
-            # -----------------------------
-            self.aligner_cache[reads_id] = "minimap2"
-            self.backend_cache["aligner"] = self.aligner_cache
+        if self.backend_cache.get("busco") != backend_used:
+            self.backend_cache["busco"] = backend_used
             self._save_backend_cache()
 
-            return sam_file
+        matches = list(out_dir.glob(f"short_summary.specific.{lineage}.*.json"))
+        if not matches:
+            matches = list(out_dir.glob("short_summary.*.json"))
+        if not matches:
+            raise FileNotFoundError(f"BUSCO summary JSON not found in {out_dir}")
 
-    def convert_sam_to_bam(self, sam_file, bam_file=None, threads=None):
+        return self.parse_busco_results(str(matches[0]))
+
+    @staticmethod
+    def parse_busco_results(busco_json_file):
+        with open(busco_json_file, "r") as f:
+            data = json.load(f)
+
+        return {
+            "single_copy": np.log(data["results"]["Single copy BUSCOs"] + 1),
+            "multi_copy": np.log(data["results"]["Multi copy BUSCOs"] + 1),
+            "fragmented": np.log(data["results"]["Fragmented BUSCOs"] + 1),
+            "missing": np.log(data["results"]["Missing BUSCOs"] + 1),
+        }
+
+    # ------------------------------------------------------------------ CRAQ
+    def run_craq(self, fasta_file):
         """
-        Convert SAM file to BAM format and sort it.
+        Reference-free error detection with CRAQ (Clipping Reveals Assembly Quality).
 
-        Args:
-            sam_file (str): Path to the input SAM file.
-            bam_file (str, optional): Output BAM file. Defaults to input with .bam extension.
-            threads (int, optional): Number of CPU threads. If not provided, use self.threads.
+        CRAQ maps the reads back to the assembly with minimap2 and converts the
+        clipped-alignment signal into error coordinates and quality indices:
+
+            craq -g asm.fa -sms reads.fa -x <preset> -t <threads> -D <outdir>
+
+        Only the SMS (long-read) arm is used -- we have no NGS short reads --
+        so `-ngs` is omitted. Per CRAQ's own documentation, running without NGS
+        data means fewer CREs and CRHs are detected (more so for ONT-based
+        assemblies), while CSE/CSH detection, which is what the long reads are
+        good for, is unaffected.
+
+        Why AQI rather than a raw count: R-AQI and S-AQI are *normalised*
+        (errors per unit length, mapped onto 0-100), so they degrade gracefully
+        as coverage drops instead of collapsing toward zero the way a raw
+        variant count does. CRAQ's own quality bands: >90 reference, 80-90
+        high, 60-80 draft, <60 low.
 
         Returns:
-            str: Path to the output BAM file.
+            dict of CRAQ metrics (all raw, i.e. not log-transformed).
         """
-        threads = threads or self.threads
-        if bam_file is None:
-            bam_file = sam_file.replace(".sam", ".bam")
+        preset = "map-ont" if self.ont else "map-hifi"
 
-        # Convert SAM to BAM
-        command = f"samtools view -@ {threads} -b -h -o {bam_file} {sam_file}"
+        # CRAQ creates its -D output directory itself and aborts if it already
+        # exists ("cannot create directory ... already exists, Exit !"). We must
+        # therefore NOT pre-create it, and must clear any stale copy left by an
+        # earlier attempt at this trial (a re-run, a retried prune, etc.). The
+        # parent (self.trial_dir) is created on access; only the craq/ leaf is
+        # handed to CRAQ, and it must be absent.
+        craq_dir = self.trial_dir / "craq"
+        if craq_dir.exists():
+            shutil.rmtree(craq_dir)
+
+        command = (
+            f"craq -g {fasta_file} -sms {self.subset_reads} "
+            f"-x {preset} -q {self.craq_mapq} -t {self.threads} "
+            f"-pl F -D {craq_dir}"
+        )
+
+        timeout_seconds = (
+            self.craq_walltime_hours * 3600 if self.craq_walltime_hours else None
+        )
+
         try:
-            self.run_command(self, command, "samtools_view")
-        except RuntimeError:
-            self.logger.error("SAM to BAM conversion failed")
+            self.run_command(command, "craq", timeout_seconds=timeout_seconds)
+        except (RuntimeError, TimeoutError):
+            self.logger.error("CRAQ analysis failed")
             raise
 
-        return bam_file
+        reports = list(craq_dir.glob("**/runAQI_out/out_final.Report"))
+        if not reports:
+            reports = list(craq_dir.glob("**/out_final.Report"))
+        if not reports:
+            raise FileNotFoundError(f"CRAQ report not found under {craq_dir}")
 
-    def sort_bam(self, bam_file, sorted_bam_file=None, threads=None):
+        return self.parse_craq_report(reports[0])
+
+    def craq_bam(self):
         """
-        Sort a BAM file.
+        Path to the sorted, indexed long-read BAM that CRAQ already produced.
 
-        Args:
-            bam_file (str): Path to the input BAM file.
-            sorted_bam_file (str, optional): Output sorted BAM file. Defaults to input with .sorted.bam.
-            threads (int, optional): Number of CPU threads. If not provided, use self.threads.
-
-        Returns:
-            str: Path to the sorted BAM file.
+        CRAQ writes ``LRout/LR_sort.bam`` (+ .bai) as a by-product of its own
+        minimap2 run, so sniffles can consume it directly instead of us paying
+        for a second alignment of the same reads against the same assembly.
         """
-        threads = threads or self.threads
-        if sorted_bam_file is None:
-            sorted_bam_file = bam_file.replace(".bam", ".sorted.bam")
+        candidates = list((self.trial_dir / "craq").glob("**/LRout/LR_sort.bam"))
+        return candidates[0] if candidates else None
 
-        command = f"samtools sort -@ {threads} -o {sorted_bam_file} {bam_file}"
-        try:
-            self.run_command(self, command, "samtools_sort")
-        except RuntimeError:
-            self.logger.error("BAM sorting failed")
-            raise
-
-        return sorted_bam_file
-
-    def index_bam(self, bam_file):
+    def parse_craq_report(self, report_file):
         """
-        Index a sorted BAM file to create a .bai file.
+        Parse ``runAQI_out/out_final.Report``.
 
-        Args:
-            bam_file (str): Path to the sorted BAM file.
+        The file is a short report with one row per sequence plus a whole-
+        assembly row labelled ``Genome``. Columns (see
+        ``src/format_results_addAQI.pl`` in JiaoLaboratory/CRAQ):
 
-        Returns:
-            str: Path to the BAM index file.
+            #Chr  Covered.Rate  Low-conf.Rate  Avg.CRH  Avg.CSH
+                  Avg.CRE(R-AQI)  Avg.CSE(S-AQI)  AQI
+
+        AQI is the harmonic mean of R-AQI and S-AQI.
         """
-        bam_index_file = f"{bam_file}.bai"
-        command = f"samtools index {bam_file}"
-        try:
-            self.run_command(self, command, "samtools_index")
-        except RuntimeError:
-            self.logger.error("BAM indexing failed")
-            raise
+        metrics = {}
 
-        return bam_index_file
+        row = None
+        with open(report_file, "r") as fh:
+            for line in fh:
+                fields = line.rstrip("\n").split("\t")
+                if fields and fields[0] == "Genome":
+                    row = fields
+                    break
 
-    def parse_samtools_stats(self, sam_file):
-        """
-        Parse samtools stats output to extract average alignment length and mapping quality.
-
-        Args:
-            sam_file (str): Path to the aligned SAM file.
-
-        Returns:
-            dict: Dictionary of raw alignment statistics.
-        """
-        command = f"samtools stats {sam_file}"
-        stdout, _, _ = self.run_command(self, command, "samtools_stats")
-
-        stats = {}
-        for key, pattern in self.stats_patterns.items():
-            match = pattern.search(stdout)
-            if match:
-                try:
-                    value = float(match.group(1))
-                    # Return raw values
-                    stats[key] = np.log(value + 1)
-                except (ValueError, TypeError) as e:
-                    self.logger.warning(f"Value conversion failed for {key}: {e}")
-                    stats[key] = 0
-            else:
-                self.logger.warning(f"Pattern not found for {key} in samtools output")
-                stats[key] = 0
-
-        return stats
-
-    def run_sniffles2(self, bam_file, vcf_file=None):
-        """
-        Run sniffles2 on the sorted BAM file to detect structural variants.
-
-        Args:
-            bam_file (str): Path to the sorted BAM file.
-            vcf_file (str, optional): Output VCF file. Defaults to sniffles_output.vcf.
-
-        Returns:
-            dict: Parsed sniffles2 metrics.
-        """
-        if vcf_file is None:
-            # Use trial ID if available for unique filenames
-            trial_suffix = (
-                f"trial_{self.trial_id}" if self.trial_id is not None else "default"
+        if row is None or len(row) < 7:
+            self.logger.warning(
+                f"No whole-assembly 'Genome' row found in {report_file}; "
+                "CRAQ metrics unavailable for this trial."
             )
-            vcf_file = f"sniffles_output_{trial_suffix}.vcf"
+            return metrics
+
+        def _split_paren(text):
+            m = self.craq_value_paren.match(text.strip())
+            if not m:
+                return 0.0, 0.0
+            return float(m.group(1)), float(m.group(2))
+
+        try:
+            covered = float(row[1])
+            low_conf = float(row[2])
+            cre, r_aqi = _split_paren(row[5])
+            cse, s_aqi = _split_paren(row[6])
+        except (ValueError, IndexError) as e:
+            self.logger.warning(f"Failed to parse CRAQ report {report_file}: {e}")
+            return metrics
+
+        if len(row) >= 8:
+            try:
+                aqi = float(row[7])
+            except ValueError:
+                aqi = 0.0
+        else:
+            aqi = 0.0
+
+        # Older CRAQ builds omit the final AQI column; recompute it.
+        if aqi <= 0 and (r_aqi + s_aqi) > 0:
+            aqi = 2 * r_aqi * s_aqi / (r_aqi + s_aqi)
+
+        metrics = {
+            "aqi": aqi,
+            "r_aqi": r_aqi,
+            "s_aqi": s_aqi,
+            "cre_per_mb": cre,
+            "cse_per_mb": cse,
+            "craq_covered_rate": covered,
+            "craq_low_conf_rate": low_conf,
+        }
+
+        if low_conf > 0.5:
+            self.logger.warning(
+                f"CRAQ flagged {low_conf * 100:.1f}% of the assembly as low-confidence. "
+                "This almost always means the read subset is too shallow; consider "
+                "raising --num-reads so CRAQ sees at least ~10x coverage."
+            )
+
+        return metrics
+
+    # --------------------------------------------------------------- sniffles
+    def run_sniffles2(self, bam_file, vcf_file=None):
+        """Call SVs from CRAQ's already-sorted, already-indexed long-read BAM."""
+        if vcf_file is None:
+            vcf_file = self.trial_dir / "sniffles_output.vcf"
 
         command = f"sniffles -i {bam_file} -v {vcf_file} --allow-overwrite"
-
         try:
-            self.run_command(self, command, "sniffles2")
+            self.run_command(command, "sniffles2")
             return self.parse_sniffles_vcf(vcf_file)
         except RuntimeError:
             self.logger.error("Sniffles2 analysis failed")
             raise
 
     def parse_sniffles_vcf(self, vcf_file):
-        """
-        Parse sniffles2 VCF output to extract structural variant metrics.
-
-        Args:
-            vcf_file (str): Path to sniffles VCF file.
-
-        Returns:
-            dict: Dictionary of raw sniffles metrics.
-        """
-        metrics = {
-            "num_sv": 0,
-        }
-
+        metrics = {"num_sv": 0}
         try:
             if not os.path.exists(vcf_file):
                 self.logger.warning(f"Sniffles VCF file not found: {vcf_file}")
                 return metrics
 
             with open(vcf_file, "r") as f:
-                sv_count = 0
-                for line in f:
-                    # Skip header lines (start with # or ##)
-                    if line.startswith("#"):
-                        continue
-                    # Count non-empty lines that aren't comments
-                    if line.strip():
-                        sv_count += 1
+                sv_count = sum(
+                    1 for line in f if line.strip() and not line.startswith("#")
+                )
 
-                # Return raw count
-                metrics["num_sv"] = np.log(sv_count + 1)
-                self.logger.debug(f"Detected {sv_count} structural variants")
-
+            metrics["num_sv"] = np.log(sv_count + 1)
+            self.logger.debug(f"Detected {sv_count} structural variants")
         except Exception as e:
             self.logger.warning(f"Failed to parse sniffles VCF {vcf_file}: {e}")
             metrics["num_sv"] = 0
-
         return metrics
 
-    @staticmethod
-    def parse_busco_results(busco_json_file):
-        """
-        Parse BUSCO results from JSON file.
-
-        Args:
-            busco_json_file (str): Path to BUSCO JSON summary.
-
-        Returns:
-            dict: Dictionary of raw BUSCO metrics.
-        """
-        with open(busco_json_file, "r") as f:
-            data = json.load(f)
-
-        metrics = {
-            "single_copy": np.log(data["results"]["Single copy BUSCOs"] + 1),
-            "multi_copy": np.log(data["results"]["Multi copy BUSCOs"] + 1),
-            "fragmented": np.log(data["results"]["Fragmented BUSCOs"] + 1),
-            "missing": np.log(data["results"]["Missing BUSCOs"] + 1),
-        }
-        return metrics
-
+    # ---------------------------------------------------------------- scoring
     def _load_weights(self):
-        """Load metric weights from a JSON config file, falling back to defaults.
-
-        Search order:
-        - ./weights.json (current working dir)
-        - repository root weights.json (two levels up from this file)
-        """
+        """Load metric weights from weights.json, falling back to defaults."""
         default_weights = {
             "num_contigs": -0.8,
             "length_diff": -1,
@@ -626,13 +748,19 @@ class AssemblyEvaluator:
             "multi_copy": -0.7,
             "fragmented": -0.7,
             "missing": -1,
-            "reads_mapped": 0.8,
-            "error_rate": -1,
             "num_sv": -0.5,
-            "supplementary_alignments": -0.6,
+            # Raw (non-log) metrics. QV is Phred (~40-60), completeness is a
+            # percentage (~95-100) and AQI is 0-100, so the weights are
+            # deliberately small to keep their contributions on the same order
+            # as log-scale n50.
+            "qv": 0.1,
+            "kmer_completeness": 0.1,
+            # CRAQ's overall AQI (harmonic mean of R-AQI and S-AQI). r_aqi and
+            # s_aqi are recorded as trial attributes but deliberately left out
+            # of the weighted sum: they are collinear with aqi by construction.
+            "aqi": 0.1,
         }
 
-        # Candidate locations for user-editable config
         candidates = [
             Path.cwd() / "weights.json",
             Path(__file__).parent / "weights.json",
@@ -644,7 +772,6 @@ class AssemblyEvaluator:
                 if p.exists():
                     with open(p, "r") as fh:
                         loaded = json.load(fh)
-                    # Validate and coerce numeric values
                     validated = {}
                     for k, v in default_weights.items():
                         if k in loaded:
@@ -665,51 +792,37 @@ class AssemblyEvaluator:
 
         return default_weights
 
+    #: subset of RAW_METRICS produced by yak, dropped when --no-kmer-eval
+    YAK_METRICS = frozenset({"qv", "kmer_completeness"})
+
+    def active_weights(self):
+        """Weights restricted to the metrics this run will actually produce."""
+        weights = dict(self.weights)
+        if not self.kmer_eval:
+            for k in self.YAK_METRICS:
+                weights.pop(k, None)
+        return weights
+
     def calculate_weighted_sum(self, metrics):
-        """
-        Calculate weighted sum of metrics using log-transformed values directly.
-
-        Args:
-            metrics (dict): Dictionary of log-transformed metric scores (from parsing stage).
-
-        Returns:
-            float: Weighted sum of log-transformed metrics (sum of weight × log_value).
-        """
         weighted_sum = 0.0
-        for metric_name, weight in self.weights.items():
-            log_value = metrics.get(metric_name, 0.0)
-            weighted_sum += weight * log_value
+        for metric_name, weight in self.active_weights().items():
+            weighted_sum += weight * metrics.get(metric_name, 0.0)
         return weighted_sum
 
     def analyze_metric_contributions(self, metrics):
-        """
-        Analyze the contribution of each metric to the weighted score.
-
-        Returns detailed breakdown of how each metric contributes to the final score.
-
-        Args:
-            metrics (dict): Already log-transformed metric values (from evaluation parsing).
-
-        Returns:
-            dict: Detailed contribution analysis including log-transformed values, weights,
-                  contributions, and proportions.
-        """
         contributions = {}
         weighted_sum = 0.0
 
-        # Calculate contribution of each metric
-        for metric_name, weight in self.weights.items():
-            log_value = float(metrics.get(metric_name, 0.0))
-            contribution = weight * log_value
+        for metric_name, weight in self.active_weights().items():
+            value = float(metrics.get(metric_name, 0.0))
+            contribution = weight * value
             weighted_sum += contribution
-
             contributions[metric_name] = {
-                "log_value": log_value,
+                "log_value": value,
                 "weight": weight,
                 "contribution": contribution,
             }
 
-        # Calculate proportions (percentage of total positive contributions)
         positive_contributions = sum(
             c["contribution"] for c in contributions.values() if c["contribution"] > 0
         )
@@ -721,7 +834,7 @@ class AssemblyEvaluator:
             )
         )
 
-        for metric_name, data in contributions.items():
+        for data in contributions.values():
             if positive_contributions > 0 and data["contribution"] > 0:
                 data["proportion"] = (
                     data["contribution"] / positive_contributions
@@ -740,139 +853,110 @@ class AssemblyEvaluator:
             "contributions": contributions,
         }
 
+    # ------------------------------------------------------------- evaluation
     def evaluate_assembly(
         self,
         gfa_file,
         fasta_file,
         include_busco=True,
         busco_lineage="metazoa_odb12",
-        download_path=None,
+        extra_fasta_files=None,
     ):
         """
-        Perform a full evaluation pipeline for a given assembly.
+        Run the full evaluation pipeline for one assembly.
 
         Args:
-            gfa_file (str): Path to the input GFA file.
-            fasta_file (str): Path to the output FASTA file.
-            include_busco (bool): Whether to run BUSCO.
+            gfa_file: Primary GFA produced by hifiasm.
+            fasta_file: Where to write the FASTA derived from ``gfa_file``.
+            include_busco: Run BUSCO.
+            busco_lineage: BUSCO lineage dataset name.
+            extra_fasta_files: Additional haplotype FASTAs, used only to make
+                the k-mer completeness estimate reflect the whole diploid
+                assembly rather than one haplotype.
 
         Returns:
-            float: Weighted score of assembly quality.
+            dict of metrics (see the class docstring for the log convention).
         """
-        if not Path(gfa_file).exists():
+        gfa_file = Path(gfa_file)
+        if not gfa_file.exists():
             raise FileNotFoundError(f"GFA file not found: {gfa_file}")
 
+        tdir = self.trial_dir
+
         try:
-            # Stage 1: GFA to FASTA conversion
             self.logger.info("Converting GFA to FASTA")
             self.convert_gfa_to_fasta(gfa_file, fasta_file)
 
-            # Stage 2: Read alignment
-            self.logger.info("Running minimap2 alignment")
-            aln_file = self.run_minimap2_align(
-                fasta_file, self.subset_reads, self.aln_file, threads=self.threads
-            )
+            self.logger.info("Running CRAQ for reference-free error detection")
+            metrics_craq = self.run_craq(fasta_file)
 
-            # Stage 3: Parse alignment stats
-            self.logger.info("Parsing alignment statistics")
-            metrics_minimap2 = self.parse_samtools_stats(aln_file)
-
-            # Stage 4: Convert SAM to sorted BAM for sniffles2
-            self.logger.info("Converting SAM to sorted BAM and indexing")
-            bam_file = self.convert_sam_to_bam(aln_file)
-            sorted_bam_file = self.sort_bam(bam_file)
-            self.index_bam(sorted_bam_file)
-
-            # Stage 5: Assembly statistics
             self.logger.info("Running gfastats")
             metrics_gfastats = self.run_gfastats(gfa_file)
 
-            combined_metrics = {**metrics_gfastats, **metrics_minimap2}
+            combined_metrics = {**metrics_gfastats, **metrics_craq}
 
-            # Stage 6: Structural variant detection with sniffles2
-            self.logger.info("Running sniffles2 for structural variant detection")
-            metrics_sniffles = self.run_sniffles2(sorted_bam_file)
-            combined_metrics.update(metrics_sniffles)
+            # Reuse the sorted+indexed BAM CRAQ already built rather than
+            # aligning the same reads to the same assembly a second time.
+            sorted_bam_file = self.craq_bam()
+            if sorted_bam_file is None:
+                self.logger.warning(
+                    "CRAQ did not leave an LRout/LR_sort.bam behind; "
+                    "skipping sniffles2 for this trial."
+                )
+            else:
+                self.logger.info("Running sniffles2 for structural variant detection")
+                combined_metrics.update(self.run_sniffles2(sorted_bam_file))
 
-            # Stage 7: BUSCO evaluation (optional)
+            if self.kmer_eval:
+                self.logger.debug("Running yak for QV and k-mer completeness")
+                combined_metrics.update(
+                    self.run_yak_qv(fasta_file, extra_fasta_files=extra_fasta_files)
+                )
+
             if include_busco:
                 self.logger.info("Running BUSCO evaluation")
-                metrics_busco = self.run_busco(
-                    fasta_file, lineage=busco_lineage, download_path=self.download_path
+                combined_metrics.update(
+                    self.run_busco(fasta_file, lineage=busco_lineage)
                 )
-                combined_metrics.update(metrics_busco)
 
-            # Return raw metrics dict for multicriteria optimization
             return combined_metrics
 
         except Exception as e:
             stage_info = self._get_current_stage(e)
             self.logger.error(f"Assembly evaluation failed at stage: {stage_info}")
+            raise
 
+    # ---------------------------------------------------------------- cleanup
     def cleanup_intermediate_files(self, trial_id=None):
         """
-        Clean up intermediate files generated during assembly evaluation.
-        Removes SAM, unsorted BAM files, and other temporary files.
+        Remove a trial's evaluation scratch directory.
 
-        Args:
-            trial_id (int, optional): Trial ID for prefix matching.
+        Everything a trial produces during evaluation lives in
+        ``work/trials/trial_<id>/``, so cleanup is a single rmtree. The
+        assembly itself (in ``work/hifiasm/``) is left alone, since hifiasm
+        reuses its .bin files across trials.
         """
+        tid = trial_id if trial_id is not None else self.trial_id
+        target = self.paths.trials_dir / f"trial_{tid if tid is not None else 'main'}"
         try:
-            import glob
-
-            # List of patterns for intermediate files to remove
-            patterns_to_remove = [
-                "*.sam",  # SAM alignment files
-                "*.bam",  # Unsorted BAM files (keep only sorted)
-                "subset_reads.*",  # Subsetted reads (can be regenerated)
-                "sniffles_output_*.vcf",  # Trial-specific sniffles VCF files
-                "busco_output_trial_assembly/*",  # Trial BUSCO outputs
-            ]
-
-            removed_count = 0
-            for pattern in patterns_to_remove:
-                for filepath in glob.glob(pattern):
-                    try:
-                        # Don't remove sorted BAM files
-                        if filepath.endswith(".sorted.bam") or filepath.endswith(
-                            ".sorted.bam.bai"
-                        ):
-                            continue
-
-                        if os.path.isfile(filepath):
-                            os.remove(filepath)
-                            removed_count += 1
-                            self.logger.debug(f"Removed intermediate file: {filepath}")
-                        elif os.path.isdir(filepath):
-                            import shutil
-
-                            shutil.rmtree(filepath)
-                            removed_count += 1
-                            self.logger.debug(
-                                f"Removed intermediate directory: {filepath}"
-                            )
-                    except Exception as e:
-                        self.logger.warning(f"Failed to remove {filepath}: {e}")
-
-            if removed_count > 0:
-                self.logger.info(f"Cleaned up {removed_count} intermediate files")
-
+            if target.exists():
+                shutil.rmtree(target)
+                self.logger.info(f"Removed intermediate directory: {target}")
         except Exception as e:
-            self.logger.warning(f"Cleanup failed: {e}")
+            self.logger.warning(f"Cleanup failed for {target}: {e}")
 
     def _get_current_stage(self, error):
-        """Determine which stage failed based on error type/message."""
         error_str = str(error).lower()
-        if "gfa" in error_str or "convert" in error_str:
-            return "GFA to FASTA conversion"
-        elif "minimap2" in error_str or "alignment" in error_str:
-            return "Read alignment"
-        elif "samtools" in error_str or "stats" in error_str:
-            return "Alignment statistics parsing"
-        elif "gfastats" in error_str:
+        if "gfastats" in error_str:
             return "Assembly statistics"
-        elif "sniffles" in error_str or "sv" in error_str:
+        elif "gfa" in error_str or "convert" in error_str:
+            return "GFA to FASTA conversion"
+        elif "craq" in error_str or "aqi" in error_str:
+            return "CRAQ error detection"
+        elif "sniffles" in error_str:
             return "Structural variant detection"
+        elif "yak" in error_str:
+            return "k-mer evaluation"
         elif "busco" in error_str:
             return "BUSCO evaluation"
         else:

@@ -1,12 +1,13 @@
-{  "num_contigs": "minimize",
-  "length_diff": "minimize",
+{
   "n50": "maximize",
+  "num_contigs": "minimize",
+  "length_diff": "minimize",
   "single_copy": "maximize",
   "multi_copy": "minimize",
   "fragmented": "minimize",
   "missing": "minimize",
-  "reads_mapped": "maximize",
-  "error_rate": "minimize",
   "num_sv": "minimize",
-  "supplementary_alignments": "minimize"
+  "qv": "maximize",
+  "kmer_completeness": "maximize",
+  "aqi": "maximize"
 }

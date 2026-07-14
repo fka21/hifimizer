@@ -70,7 +70,7 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--version", action="version", version="%(prog)s 1.0.9")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.1.0")
 
     # Required Inputs
     required = parser.add_argument_group("Required arguments")
@@ -106,6 +106,17 @@ def get_args():
         help="Custom BUSCO download path. If set, BUSCO datasets will not be (re)downloaded.",
     )
 
+    general.add_argument(
+        "--hom-cov",
+        type=int,
+        default=None,
+        metavar="COV",
+        help=(
+            "Homozygous read coverage passed to hifiasm --hom-cov option. "
+            "If not set, hifiasm auto-detects it from the read depth histogram."
+        ),
+    )
+
     # Optimization Parameters
     optimization = parser.add_argument_group("Optimization options")
     optimization.add_argument(
@@ -123,7 +134,12 @@ def get_args():
         "--num-reads",
         type=int,
         default=100000,
-        help="Number of reads to subset for minimap2",
+        help=(
+            "Number of reads to subset for the alignment-based metrics (CRAQ, "
+            "sniffles2). CRAQ's AQI is a normalised metric and so degrades "
+            "gracefully with coverage, but aim for at least ~10x: below that, "
+            "large fractions of the assembly get flagged low-confidence."
+        ),
     )
     optimization.add_argument(
         "--no-busco",
@@ -163,7 +179,8 @@ def get_args():
         help=(
             "Validate inputs and environment without running any assemblies. "
             "Checks that all input files exist, required tools (hifiasm, busco, "
-            "gfastats) are on PATH, and prints the trial-0 hifiasm command, then exits."
+            "gfastats, yak) are on PATH, and prints the trial-0 hifiasm command, "
+            "then exits."
         ),
     )
     optimization.add_argument(
@@ -198,14 +215,70 @@ def get_args():
         ),
     )
     optimization.add_argument(
+        "--busco-walltime",
+        type=float,
+        default=6.0,
+        metavar="HOURS",
+        help=(
+            "Maximum wall-clock time in hours allowed for a single BUSCO "
+            "gene-prediction attempt. BUSCO is tried with miniprot, then metaeuk, "
+            "then augustus; each attempt gets this budget and the whole process "
+            "group is killed on expiry. Default: 6 hours."
+        ),
+    )
+    optimization.add_argument(
+        "--craq-walltime",
+        type=float,
+        default=6.0,
+        metavar="HOURS",
+        help=(
+            "Maximum wall-clock time in hours allowed for the CRAQ run of a single "
+            "trial. On expiry the whole process group is killed and the trial is "
+            "pruned. Default: 6 hours."
+        ),
+    )
+    optimization.add_argument(
+        "--craq-mapq",
+        type=int,
+        default=20,
+        metavar="MAPQ",
+        help="Minimum read mapping quality passed to CRAQ (-q).",
+    )
+    optimization.add_argument(
+        "--no-kmer-eval",
+        dest="kmer_eval",
+        action="store_false",
+        help=(
+            "Disable the yak-based k-mer metrics (consensus QV and k-mer "
+            "completeness). By default they are included; the read k-mer hash is "
+            "built once during setup and reused by every trial."
+        ),
+    )
+    optimization.add_argument(
+        "--kmer-k",
+        type=int,
+        default=31,
+        metavar="K",
+        help="k-mer length passed to `yak count` (-k).",
+    )
+    optimization.add_argument(
+        "--yak-bloom-bits",
+        type=int,
+        default=37,
+        metavar="BITS",
+        help=(
+            "Bloom-filter size passed to `yak count` (-b), used to discard "
+            "singleton k-mers. 37 is lh3's recommendation for human-scale, "
+            "high-coverage read sets. Set to 0 to disable the Bloom filter "
+            "(needed for low-coverage read sets, at the cost of memory)."
+        ),
+    )
+    optimization.add_argument(
         "--seed",
         type=int,
         default=42,
         help="Random seed for reproducibility. If not set, results may vary between runs.",
     )
-
-    # Multi-objective options
-    # Multi-criteria optimization is used by default (no CLI toggle).
 
     # Optional Input Data
     optional_inputs = parser.add_argument_group(
