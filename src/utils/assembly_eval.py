@@ -1109,7 +1109,7 @@ class AssemblyEvaluator:
             f"busco -i {fasta_file} -l {lineage} -m {mode} "
             f"-o {out_name} --out_path {tdir} "
             f"-c {self.threads} --skip_bbtools --force "
-            f"--download_path {self.download_path} --offline"
+            f"--download_path {self.download_path}"
         )
 
         timeout_seconds = self.stage_walltime_seconds("busco")
