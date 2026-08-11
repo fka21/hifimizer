@@ -1,9 +1,51 @@
 import logging
+import shutil
 from pathlib import Path
 
 from utils.subprocess_logger import SubprocessLogger
 
 logger = logging.getLogger(__name__)
+
+#: Every tunable hifiasm parameter hifimizer knows how to replay from a
+#: recorded trial. Kept here, next to ``build_hifiasm_command``, so that adding
+#: a parameter is a single-file change.
+HIFIASM_PARAM_KEYS = (
+    "x", "y", "s", "n", "m", "p", "u",
+    "D", "N", "max_kocc",
+    "s_base", "f_perturb", "l_msjoin",
+    "path_max", "path_min",
+)
+
+
+def collect_hifiasm_outputs(prefix, dest_dir, label) -> int:
+    """
+    Copy the hifiasm outputs sitting at ``prefix`` into ``dest_dir``.
+
+    Every trial shares one hifiasm ``-o`` prefix so the ``*.bin`` files are
+    reused, which means a result has to be copied out before the next trial
+    overwrites it. The ``.bin`` files themselves are deliberately not copied:
+    they are large, and they are the thing we want left in place.
+
+    Returns:
+        Number of files copied.
+    """
+    prefix = Path(prefix)
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    for f in sorted(prefix.parent.glob(f"{prefix.name}*")):
+        if not f.is_file() or f.suffix == ".bin":
+            continue
+        target = dest_dir / f"{label}{f.name[len(prefix.name):]}"
+        try:
+            shutil.copy2(f, target)
+            copied += 1
+        except Exception as e:
+            logger.warning(f"Could not copy {f.name} -> {target}: {e}")
+
+    logger.info(f"Copied {copied} file(s) to {dest_dir}")
+    return copied
 
 
 def build_hifiasm_command(
@@ -74,7 +116,9 @@ def build_hifiasm_command(
         return cmd.strip()
 
     # --- tunable parameters ----------------------------------------------
-    if not None in [x, y, s, n, m, p]:
+    # All six are emitted together or not at all: hifiasm's graph-cleaning
+    # parameters are only meaningful as a set.
+    if all(v is not None for v in (x, y, s, n, m, p)):
         cmd += f"-x {x} -y {y} -s {s} -n {n} -m {m} -p {p} "
 
     if u is not None:
@@ -95,7 +139,7 @@ def build_hifiasm_command(
             cmd += f"--path-min {path_min} "
 
     if sensitive:
-        if not None in [D, N, max_kocc]:
+        if all(v is not None for v in (D, N, max_kocc)):
             cmd += f"-D {D} -N {N} --max-kocc {max_kocc} "
 
     return cmd.strip()

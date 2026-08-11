@@ -1,24 +1,162 @@
 Bootstrap: docker
 From: continuumio/miniconda3
 
+# ============================================================================
+# Hifimizer - Apptainer/Singularity definition
+#
+# Equivalent to the project Dockerfile. Mapping of the Docker concepts:
+#
+#   COPY            -> %files
+#   RUN             -> %post
+#   ENV             -> %environment  (runtime) and/or export in %post (build)
+#   ENTRYPOINT/CMD  -> %runscript
+#   SHELL [conda..] -> explicit `conda activate` inside %post
+#
+# Note that unlike Docker, %environment is evaluated at *runtime*, so the conda
+# environment is activated for `apptainer run/exec/shell` without needing a
+# separate entrypoint script.
+# ============================================================================
+
 %files
-    /projects/ferenc.kagan/hifimizer-docker/environment.yml /opt/project/environment.yml
-    /projects/ferenc.kagan/hifimizer-docker/src /opt/project/src
-    /home/ferenc.kagan/.cache/optunahub/github.com /root/.cache/optunahub/github.com
+    environment.yml /opt/project/environment.yml
+    src /opt/project/src
 
 %post
-    # Install conda env
-    conda env create -f /opt/project/environment.yml
-    echo "conda activate optimizer" >> ~/.bashrc
-    cp -r /opt/project/src/* /usr/local/bin
-    mkdir -p /tmp/matplotlib_cache
+    set -eu
 
-%environment
-    export PATH=/usr/local/bin:$PATH
-    export XDG_CACHE_HOME=/root/.cache
-    export MPLCONFIGDIR=/tmp/matplotlib_cache
-    source /opt/conda/etc/profile.d/conda.sh
+    # ------------------------------------------------------------------
+    # 1. System dependencies FIRST
+    # ------------------------------------------------------------------
+    apt-get update && apt-get install -y \
+        build-essential \
+        git \
+        wget \
+        zlib1g-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+    # ------------------------------------------------------------------
+    # 2. Conda env
+    # ------------------------------------------------------------------
+    cd /opt/project
+    conda env create -f environment.yml
+    conda clean --all --yes
+
+    # There is no SHELL directive in Apptainer, so activate the env explicitly
+    # for the remainder of the build.
+    . /opt/conda/etc/profile.d/conda.sh
     conda activate optimizer
 
+    # ------------------------------------------------------------------
+    # 3. Install yak (k-mer QV + completeness)
+    # ------------------------------------------------------------------
+    # environment.yml already pulls yak from bioconda so that a plain
+    # `conda env create` works without a container. The conda env's bin
+    # directory takes precedence over /usr/local/bin, so we install the source
+    # build straight into $CONDA_PREFIX/bin to make sure the version we
+    # actually run is this one.
+    cd /opt
+    git clone https://github.com/lh3/yak.git
+    cd yak
+    make
+    cp yak "${CONDA_PREFIX}/bin/"
+    yak version
+    cd /opt && rm -rf /opt/yak
+
+    # ------------------------------------------------------------------
+    # 4. Your code
+    # ------------------------------------------------------------------
+    chmod -R a+rX /opt/project/src
+    chmod a+x /opt/project/src/hifimizer.py || true
+
+    # The image filesystem is read-only at runtime; make sure nothing in the
+    # build left root-only permissions that a normal HPC user cannot read.
+    chmod -R a+rX /opt/conda
+
+%environment
+    # Evaluated at runtime for run/exec/shell. This is what puts numpy,
+    # hifiasm, busco, yak, craq, samtools, minimap2 and sniffles on PATH.
+    #
+    # We deliberately do NOT use `conda activate` here. Activation relies on a
+    # shell function sourced from conda.sh and can fail silently in the
+    # non-interactive `sh` that Apptainer uses to source this section -- when
+    # it does, PATH keeps pointing at the base interpreter and you get
+    # "ModuleNotFoundError: No module named 'numpy'" at runtime even though the
+    # build and %test both succeeded. Putting the env's bin directory on PATH
+    # directly is equivalent for our purposes and cannot fail this way.
+    export CONDA_PREFIX="/opt/conda/envs/optimizer"
+    export CONDA_DEFAULT_ENV="optimizer"
+    export PATH="/opt/project/src:${CONDA_PREFIX}/bin:${PATH}"
+
+    # Apptainer bind-mounts $HOME by default. Without this, a user's
+    # ~/.local/lib/python3.10/site-packages can shadow the container's
+    # packages and cause confusing version mismatches.
+    export PYTHONNOUSERSITE=1
+
+    # The image filesystem is read-only, so libraries that expect a writable
+    # cache under $HOME must be redirected or they emit errors on every run
+    # ("Read-only file system: '/root/.config'", "Fontconfig error: No
+    # writable cache directories").
+    export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
+    export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/xdg-cache}"
+    export FONTCONFIG_PATH="/etc/fonts"
+    export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-/tmp/numba-cache}"
+
+    # Keep numeric libs from oversubscribing cores on shared HPC nodes;
+    # hifimizer passes --threads to the tools that should be parallel.
+    export OPENBLAS_NUM_THREADS=1
+    export OMP_NUM_THREADS=1
+
 %runscript
-    exec python /usr/local/bin/hifimizer.py "$@"
+    # `apptainer run hifimizer.sif [args]`
+    # With no arguments, print the help (mirrors the Dockerfile CMD).
+    mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME" "$NUMBA_CACHE_DIR" 2>/dev/null || true
+    if [ $# -eq 0 ]; then
+        exec "${CONDA_PREFIX}/bin/python3" /opt/project/src/hifimizer.py --help
+    else
+        exec "${CONDA_PREFIX}/bin/python3" /opt/project/src/hifimizer.py "$@"
+    fi
+
+%test
+    # Run automatically at the end of `apptainer build`.
+    #
+    # This deliberately does NOT activate conda by hand. It tests the same
+    # PATH the user will get from %environment, so a passing build actually
+    # implies a working `apptainer exec`. (Hand-activating here is how a build
+    # can report success while `exec` still fails to import numpy.)
+    set -e
+    export MPLCONFIGDIR=/tmp/mplconfig XDG_CACHE_HOME=/tmp/xdg-cache
+    mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME"
+
+    echo "python3 resolves to: $(command -v python3)"
+    case "$(command -v python3)" in
+        /opt/conda/envs/optimizer/bin/python3) : ;;
+        *) echo "FAIL: python3 is not the optimizer env interpreter"; exit 1 ;;
+    esac
+
+    python3 -c "import numpy, optuna, Bio, psutil, plotly; print('python deps OK')"
+    for tool in hifiasm gfastats busco yak craq minimap2 samtools sniffles; do
+        command -v "$tool" >/dev/null || { echo "MISSING: $tool"; exit 1; }
+    done
+    echo "all external tools OK"
+    python3 /opt/project/src/hifimizer.py --version
+
+%labels
+    Author Ferenc Kagan
+    Name hifimizer
+    Description Bayesian optimization of hifiasm de novo genome assembly parameters
+
+%help
+    Hifimizer - optimize hifiasm assembly parameters with Optuna.
+
+    Run (the runscript calls hifimizer.py for you):
+        apptainer run --bind /path/to/data:/data hifimizer.sif \
+            --genome-size 1.2G --input-reads /data/reads.fq.gz \
+            --output-dir /data/run1 --threads 48
+
+    Or call anything in the image directly:
+        apptainer exec hifimizer.sif hifimizer.py --help
+        apptainer exec hifimizer.sif hifiasm --version
+
+    IMPORTANT: the container filesystem is read-only. --output-dir must point
+    at a bind-mounted, writable host path, and all input files must be inside
+    a bind-mounted path as well.

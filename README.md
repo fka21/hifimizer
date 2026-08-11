@@ -57,9 +57,6 @@ better) live in `src/optim_directions.json`; weights for the single-objective we
 | | `missing` | Missing BUSCOs |
 | **yak** | `qv` | Consensus accuracy (Phred-scaled) from read k-mers |
 | | `kmer_completeness` | Fraction of solid read k-mers present in the assembly |
-| **CRAQ** | `aqi` | Overall Assembly Quality Index (harmonic mean of R-AQI & S-AQI) |
-| | `r_aqi`, `s_aqi` | Regional / structural AQI (recorded, not directly weighted) |
-| | `cre_per_mb`, `cse_per_mb` | Clip-based regional / structural errors per Mb |
 | **sniffles2** | `num_sv` | Structural variants called against the assembly |
 
 A few implementation details worth knowing:
@@ -68,17 +65,8 @@ A few implementation details worth knowing:
   reused by every trial. QV is measured per-haplotype; k-mer completeness is measured on the combined
   haplotypes (hap1 + hap2) when Hi-C or ultra-long data yield a second haplotype, so that heterozygous
   sequence isn't scored as "missing". Disable with `--no-kmer-eval`.
-- **CRAQ.** Runs in SMS (long-read) only mode — no short reads are required. Its AQI is a *normalised*
-  quality index, so it degrades gracefully as coverage drops rather than collapsing to zero the way a raw
-  error count does. sniffles2 reuses the sorted BAM CRAQ already produced, so the reads are only aligned once.
 - **BUSCO** is attempted with **miniprot** first, then **metaeuk**, then **augustus**; the first backend that
   succeeds within `--busco-walltime` is cached and reused for later trials.
-
-> **Note**
->
-> CRAQ's AQI is reliable at ~10× coverage or more. With a small `--num-reads` subset on a large genome you may
-> see a large fraction of the assembly flagged low-confidence and noisy AQI values — Hifimizer warns when this
-> happens. Increase `--num-reads` until you reach roughly 10× if AQI is important to your objective.
 
 ---
 
@@ -194,7 +182,6 @@ subprocesses), and the trial is pruned.
 
 - `--trial-walltime HOURS` (default 24) — per-trial hifiasm limit; also applied to the final assembly.
 - `--busco-walltime HOURS` (default 6) — per gene-prediction-backend attempt.
-- `--craq-walltime HOURS` (default 6) — per-trial CRAQ limit.
 
 ---
 
@@ -364,13 +351,6 @@ Optimization options:
                         miniprot, then metaeuk, then augustus; each attempt
                         gets this budget and the whole process group is killed
                         on expiry. Default: 6 hours. (default: 6.0)
-  --craq-walltime HOURS
-                        Maximum wall-clock time in hours allowed for the CRAQ
-                        run of a single trial. On expiry the whole process
-                        group is killed and the trial is pruned. Default: 6
-                        hours. (default: 6.0)
-  --craq-mapq MAPQ      Minimum read mapping quality passed to CRAQ (-q).
-                        (default: 20)
   --no-kmer-eval        Disable the yak-based k-mer metrics (consensus QV and
                         k-mer completeness). By default they are included; the
                         read k-mer hash is built once during setup and reused

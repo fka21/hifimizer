@@ -77,14 +77,12 @@ def write_param_importances(
         )
         return False
 
-    param_names = sorted({k for t in trials for k in t.params})
-    if not param_names:
-        logging.warning("Parameter importance skipped: no sampled parameters found.")
-        return False
-
-    # A parameter that never varied carries no information and makes fANOVA unhappy.
+    # A parameter that never varied carries no information and makes fANOVA
+    # unhappy, so only the ones that actually moved are plotted.
     varying = [
-        p for p in param_names if len({t.params.get(p) for t in trials if p in t.params}) > 1
+        name
+        for name in sorted({k for t in trials for k in t.params})
+        if len({t.params.get(name) for t in trials if name in t.params}) > 1
     ]
     if not varying:
         logging.warning(

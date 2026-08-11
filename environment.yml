@@ -1,8 +1,7 @@
 name: optimizer
 channels:
-  - bioconda
   - conda-forge
-  - defaults
+  - bioconda
 dependencies:
   - _libgcc_mutex=0.1
   - _openmp_mutex=4.5
@@ -40,11 +39,9 @@ dependencies:
   - colorlog=6.9.0
   - comm=0.2.2
   - contourpy=1.3.1
-  - cpython=3.10.18
   - curl=8.12.1
   - cycler=0.12.1
   - cyrus-sasl=2.1.27
-  - craq
   - dav1d=1.2.1
   - dbus=1.13.6
   - debugpy=1.8.13
@@ -217,6 +214,7 @@ dependencies:
   - mysql-libs=9.0.1
   - ncbi-vdb=3.2.1
   - ncurses=6.5
+  - numpy=2.2.5
   - nest-asyncio=1.6.0
   - networkx=3.4.2
   - nomkl=1.0
@@ -374,6 +372,8 @@ dependencies:
   - requests=2.32.3
   - rpsbproc=0.5.0
   - samtools=1.21
+  - scikit-learn=1.6.1
+  - scipy=1.15.2
   - sed=4.8
   - sepp=4.5.5
   - seqtk=1.4
@@ -450,14 +450,9 @@ dependencies:
       - fastjsonschema==2.21.1
       - gfapy==1.2.3
       - ipython==8.35.0
-      - joblib==1.4.2
       - jsonschema==4.23.0
       - jsonschema-specifications==2024.10.1
       - narwhals==1.32.0
       - nbformat==5.10.4
-      - numpy==2.2.5
       - referencing==0.36.2
       - rpds-py==0.24.0
-      - scikit-learn==1.6.1
-      - scipy==1.15.2
-      - threadpoolctl==3.6.0

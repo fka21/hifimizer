@@ -1,7 +1,5 @@
-import optuna
 from typing import Optional
-import logging
-import numpy as np
+
 from scipy import stats
 
 
@@ -16,7 +14,7 @@ class MultiCriteriaConvergenceDetector:
         min_plateau_length=15,
         window_size=20,
         significance_level=0.05,
-        max_trials: Optional[int] = None,
+        min_trials: int = 5,
         directions: Optional[list] = None,
     ):
         self.detectors = {
@@ -34,68 +32,61 @@ class MultiCriteriaConvergenceDetector:
                 window_size=window_size, significance_level=significance_level
             ),
         }
-        self.convergence_votes = {}
-        self.max_trials = max_trials
+        self.min_trials = max(0, int(min_trials))
         # Directions is a list like ["maximize","minimize",...]
         # used to aggregate multi-objective values into a scalar for detectors.
         self.directions = directions
+        self._last_result = (False, [])
+
+    def _to_scalar(self, current_value):
+        """Collapse a multi-objective value tuple into one 'higher is better' number."""
+        if not isinstance(current_value, (list, tuple)):
+            try:
+                return float(current_value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        vals = list(current_value)
+        if self.directions and len(self.directions) >= len(vals):
+            signs = [
+                1 if d == "maximize" else -1 for d in self.directions[: len(vals)]
+            ]
+        else:
+            signs = [1] * len(vals)
+
+        try:
+            return sum(s * float(v) for s, v in zip(signs, vals)) / max(1, len(vals))
+        except (TypeError, ValueError):
+            return 0.0
 
     def update(self, current_value, trial_number):
-        """Update all detectors and check for convergence"""
-        if self.max_trials is not None and trial_number >= self.max_trials:
-            self._last_result = (True, ["max_trials_reached"])
-            return True, ["max_trials_reached"]
+        """Feed every detector one trial's score and take a vote."""
+        scalar_value = self._to_scalar(current_value)
 
-        if trial_number < 5 and not hasattr(self, "_last_result"):
+        # Warm-up: still feed the detectors so their histories are complete,
+        # but never let them stop the study on the first few noisy trials.
+        for detector in self.detectors.values():
+            detector.update(scalar_value, trial_number)
+
+        if trial_number < self.min_trials:
             self._last_result = (False, [])
-            return False, []
-        else:
-            # If current_value is a sequence (multi-objective), aggregate to a scalar
-            scalar_value = current_value
-            if isinstance(current_value, (list, tuple)):
-                vals = list(current_value)
-                if self.directions and len(self.directions) >= len(vals):
-                    signs = [
-                        1 if d == "maximize" else -1
-                        for d in self.directions[: len(vals)]
-                    ]
-                else:
-                    signs = [1] * len(vals)
-                # Weighted average with signs so higher scalar_value means improvement
-                scalar_value = sum(s * v for s, v in zip(signs, vals)) / max(
-                    1, len(vals)
-                )
+            return self._last_result
 
-            # Ensure scalar_value is numeric
-            try:
-                float(scalar_value)
-            except Exception:
-                scalar_value = 0.0
+        results = {
+            name: detector.has_converged()
+            for name, detector in self.detectors.items()
+        }
 
-            results = {}
-            for name, detector in self.detectors.items():
-                results[name] = detector.update(scalar_value, trial_number)
+        # Require at least floor(N/2) detectors to agree (2 of 4).
+        has_converged = sum(results.values()) >= max(1, len(self.detectors) // 2)
+        converged_methods = [name for name, result in results.items() if result]
 
-            convergence_votes = sum(results.values())
-            total_detectors = len(self.detectors)
-
-            # Lower voting threshold: require at least floor(N/2) detectors
-            # to agree (e.g., 2 of 4 -> faster convergence detection).
-            has_converged = convergence_votes >= max(1, total_detectors // 2)
-            converged_methods = [name for name, result in results.items() if result]
-
-            # Store last convergence result for external query
-            self._last_result = (has_converged, converged_methods)
-
-            return has_converged, converged_methods
+        self._last_result = (has_converged, converged_methods)
+        return self._last_result
 
     def has_converged(self):
-        """Return True if convergence detected based on last update or detector states."""
-        if hasattr(self, "_last_result"):
-            return self._last_result[0]
-
-        votes = sum(getattr(det, "converged", False) for det in self.detectors.values())
-        return votes >= 2
+        """Convergence verdict from the most recent :meth:`update`."""
+        return self._last_result[0]
 
 
 class PlateauDetector:
@@ -119,7 +110,10 @@ class PlateauDetector:
             else:
                 self.plateau_count = 0
 
-        # Converged if in plateau for sufficient time
+        return self.has_converged()
+
+    def has_converged(self):
+        """Converged once the values have sat inside the band long enough."""
         return self.plateau_count >= self.min_plateau_length
 
 
@@ -128,24 +122,34 @@ class StatisticalConvergenceDetector:
         self.window_size = window_size
         self.significance_level = significance_level
         self.history = []
+        self.converged = False
 
     def update(self, current_value, trial_number):
         self.history.append(current_value)
 
         if len(self.history) >= 2 * self.window_size:
-            # Compare recent window with older window
             recent_window = self.history[-self.window_size :]
             older_window = self.history[-2 * self.window_size : -self.window_size]
 
-            # Use Mann-Whitney U test (non-parametric)
-            statistic, p_value = stats.mannwhitneyu(
-                recent_window, older_window, alternative="greater"
-            )
+            try:
+                # Mann-Whitney U (non-parametric): is the recent window
+                # significantly better than the older one?
+                _, p_value = stats.mannwhitneyu(
+                    recent_window, older_window, alternative="greater"
+                )
+                # Converged if no significant improvement.
+                self.converged = p_value > self.significance_level
+            except ValueError:
+                # scipy raises when all values are identical -- which is
+                # itself about as converged as a study gets.
+                self.converged = True
+        else:
+            self.converged = False
 
-            # Converged if no significant improvement
-            return p_value > self.significance_level
+        return self.converged
 
-        return False
+    def has_converged(self):
+        return self.converged
 
 
 class RelativeImprovementDetector:
@@ -159,19 +163,26 @@ class RelativeImprovementDetector:
         self.history.append(current_value)
 
         if len(self.history) >= 2:
-            # Avoid division by zero
-            if self.history[-2] == 0:
-                relative_improvement = float("inf") if self.history[-1] > 0 else 0.0
+            previous = self.history[-2]
+            delta = self.history[-1] - previous
+
+            # abs() on the denominator: weighted scores can be negative, and
+            # dividing by a negative previous value flipped the sign of the
+            # improvement, so a run of worsening scores read as "improving"
+            # and convergence was never detected.
+            if previous == 0:
+                relative_improvement = float("inf") if delta > 0 else 0.0
             else:
-                relative_improvement = (
-                    self.history[-1] - self.history[-2]
-                ) / self.history[-2]
+                relative_improvement = delta / abs(previous)
 
             if relative_improvement < self.threshold:
                 self.poor_improvement_count += 1
             else:
                 self.poor_improvement_count = 0
 
+        return self.has_converged()
+
+    def has_converged(self):
         return self.poor_improvement_count >= self.patience
 
 
@@ -181,7 +192,6 @@ class StagnationDetector:
         self.min_improvement = min_improvement
         self.best_value = None
         self.stagnation_count = 0
-        self.convergence_history = []
 
     def update(self, current_value, trial_number):
         """Update convergence tracker with new value"""
@@ -198,15 +208,6 @@ class StagnationDetector:
             # Update best_value if current is better (but not by min_improvement threshold)
             if current_value > self.best_value:
                 self.best_value = current_value
-
-        self.convergence_history.append(
-            {
-                "trial": trial_number,
-                "value": current_value,
-                "best_value": self.best_value,
-                "stagnation_count": self.stagnation_count,
-            }
-        )
 
         return self.has_converged()
 

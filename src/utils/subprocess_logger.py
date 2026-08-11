@@ -2,11 +2,19 @@
 import os
 import signal
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional, Tuple
 
 # Conventional exit code used by GNU `timeout` to signal "the command timed out".
 TIMEOUT_EXIT_CODE = 124
+
+#: Every process this module has started and not yet reaped. Because each is
+#: launched with ``start_new_session=True`` it lives in its own process group,
+#: which a naive ``psutil.Process().children()`` sweep from the parent can miss.
+#: The signal handler in hifimizer drains this so Ctrl-C actually stops hifiasm.
+_ACTIVE_PROCESSES = set()
+_ACTIVE_LOCK = threading.Lock()
 
 
 class SubprocessLogger:
@@ -28,6 +36,27 @@ class SubprocessLogger:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ kill
+    @classmethod
+    def kill_all_active(cls) -> int:
+        """
+        Kill every subprocess this module started that is still running.
+
+        Called from hifimizer's SIGINT/SIGTERM handler. Returns how many
+        processes were signalled.
+        """
+        with _ACTIVE_LOCK:
+            processes = list(_ACTIVE_PROCESSES)
+
+        killed = 0
+        for process in processes:
+            if process.poll() is None:
+                cls._kill_process_tree(process)
+                killed += 1
+
+        with _ACTIVE_LOCK:
+            _ACTIVE_PROCESSES.difference_update(processes)
+        return killed
+
     @staticmethod
     def _kill_process_tree(process) -> None:
         """SIGKILL the process group, then sweep any survivors with psutil."""
@@ -109,13 +138,15 @@ class SubprocessLogger:
                 process = subprocess.Popen(
                     command,
                     shell=True,
+                    executable="/bin/bash",  # commands use `set -o pipefail`
                     stdout=f,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    bufsize=1,
                     cwd=str(cwd) if cwd else None,
                     start_new_session=True,  # own process group -> killpg works
                 )
+                with _ACTIVE_LOCK:
+                    _ACTIVE_PROCESSES.add(process)
                 try:
                     return_code = process.wait(timeout=timeout_seconds)
                 except subprocess.TimeoutExpired:
@@ -126,6 +157,9 @@ class SubprocessLogger:
                             f"{timeout_seconds} seconds; process group killed.\n"
                         )
                     return TIMEOUT_EXIT_CODE, str(log_file_path)
+                finally:
+                    with _ACTIVE_LOCK:
+                        _ACTIVE_PROCESSES.discard(process)
 
             return return_code, str(log_file_path)
 

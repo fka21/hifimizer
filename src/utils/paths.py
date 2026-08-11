@@ -18,7 +18,8 @@ be deleted without losing a result.
         ├── reads/                 subset_reads.fa
         ├── kmers/                 reads.yak
         ├── busco_downloads/       lineage datasets
-        ├── cache/                 busco_backend_cache.json
+        ├── cache/                 busco_backend_cache.json,
+        │                          metric_stage_state.json
         └── trials/trial_<id>/     sam, bam, vcf, busco output, yak qv txt
 
 Note on the shared ``work/hifiasm`` directory: every trial uses the same
@@ -78,6 +79,16 @@ class RunPaths:
     @property
     def busco_backend_cache(self) -> Path:
         return self.cache_dir / "busco_backend_cache.json"
+
+    @property
+    def metric_stage_state(self) -> Path:
+        """
+        Cross-trial record of which metric stages have failed / been retired.
+
+        Lives under ``work/cache`` so that ``--force-rerun`` (which wipes
+        ``work/``) also clears it: a fresh run should retry every stage.
+        """
+        return self.cache_dir / "metric_stage_state.json"
 
     @property
     def hifiasm_prefix(self) -> Path:

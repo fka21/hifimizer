@@ -70,7 +70,7 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--version", action="version", version="%(prog)s 1.1.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.1.1")
 
     # Required Inputs
     required = parser.add_argument_group("Required arguments")
@@ -128,17 +128,21 @@ def get_args():
         "--num-trials",
         type=int,
         default=100,
-        help="Number of trials for optimization. First 20 trials will always run, afterwards a custom multi-criteria convergence detector is used to detect convergence.",
+        help=(
+            "Maximum number of trials. The first --convergence-warmup trials "
+            "always run; after that a multi-criteria convergence detector may "
+            "stop the study early."
+        ),
     )
     optimization.add_argument(
         "--num-reads",
         type=int,
         default=100000,
         help=(
-            "Number of reads to subset for the alignment-based metrics (CRAQ, "
-            "sniffles2). CRAQ's AQI is a normalised metric and so degrades "
-            "gracefully with coverage, but aim for at least ~10x: below that, "
-            "large fractions of the assembly get flagged low-confidence."
+            "Fixed number of reads to subset for the alignment-based metrics "
+            "(samtools stats, sniffles2). This is a read *count*, not a coverage "
+            "target; the depth it works out to is computed from the sampled bases "
+            "and logged at startup. Aim for at least ~10x."
         ),
     )
     optimization.add_argument(
@@ -215,36 +219,6 @@ def get_args():
         ),
     )
     optimization.add_argument(
-        "--busco-walltime",
-        type=float,
-        default=6.0,
-        metavar="HOURS",
-        help=(
-            "Maximum wall-clock time in hours allowed for a single BUSCO "
-            "gene-prediction attempt. BUSCO is tried with miniprot, then metaeuk, "
-            "then augustus; each attempt gets this budget and the whole process "
-            "group is killed on expiry. Default: 6 hours."
-        ),
-    )
-    optimization.add_argument(
-        "--craq-walltime",
-        type=float,
-        default=6.0,
-        metavar="HOURS",
-        help=(
-            "Maximum wall-clock time in hours allowed for the CRAQ run of a single "
-            "trial. On expiry the whole process group is killed and the trial is "
-            "pruned. Default: 6 hours."
-        ),
-    )
-    optimization.add_argument(
-        "--craq-mapq",
-        type=int,
-        default=20,
-        metavar="MAPQ",
-        help="Minimum read mapping quality passed to CRAQ (-q).",
-    )
-    optimization.add_argument(
         "--no-kmer-eval",
         dest="kmer_eval",
         action="store_false",
@@ -278,6 +252,107 @@ def get_args():
         type=int,
         default=42,
         help="Random seed for reproducibility. If not set, results may vary between runs.",
+    )
+
+    # Per-stage walltimes and failure handling
+    stages = parser.add_argument_group(
+        "Metric stage walltimes and failure handling",
+        (
+            "Each metric-producing tool runs as an independent 'stage' with its "
+            "own wall-clock budget. What happens when one fails or times out "
+            "depends on when it happens. On the baseline assembly (trial 0) the "
+            "tool is judged unusable here, so it is retired for the whole study "
+            "and no later trial attempts it; the baseline is still scored on "
+            "the remaining metrics, and that reduced set becomes the objective. "
+            "From trial 1 on the tool has already been shown to work, so a "
+            "failure means the trial is discarded rather than scored on a "
+            "different metric set -- see --max-metric-skips. Either way the "
+            "run tells you loudly that a data-quality check is warranted. Set "
+            "any walltime to 0 for no limit."
+        ),
+    )
+    stages.add_argument(
+        "--gfastats-walltime",
+        type=float,
+        default=0.5,
+        metavar="HOURS",
+        help="Walltime for gfastats (num_contigs, length_diff, n50).",
+    )
+    stages.add_argument(
+        "--align-walltime",
+        type=float,
+        default=6.0,
+        metavar="HOURS",
+        help=(
+            "Walltime for the minimap2 | samtools sort read alignment. This "
+            "stage produces no metrics itself, but samtools stats and sniffles2 "
+            "both consume its BAM, so losing it loses both."
+        ),
+    )
+    stages.add_argument(
+        "--samtools-stats-walltime",
+        type=float,
+        default=1.0,
+        metavar="HOURS",
+        help=(
+            "Walltime for samtools stats (reads_mapped, error_rate, "
+            "supplementary_alignments)."
+        ),
+    )
+    stages.add_argument(
+        "--sniffles-walltime",
+        type=float,
+        default=2.0,
+        metavar="HOURS",
+        help="Walltime for sniffles2 structural-variant calling (num_sv).",
+    )
+    stages.add_argument(
+        "--yak-walltime",
+        type=float,
+        default=2.0,
+        metavar="HOURS",
+        help=(
+            "Walltime for each yak invocation: the one-off `yak count` during "
+            "setup and the per-trial `yak qv` (qv, kmer_completeness)."
+        ),
+    )
+    stages.add_argument(
+        "--busco-walltime",
+        type=float,
+        default=6.0,
+        metavar="HOURS",
+        help=(
+            "Walltime for a single BUSCO gene-prediction attempt. BUSCO is "
+            "tried with miniprot, then metaeuk, then augustus; each attempt "
+            "gets this budget and the whole process group is killed on expiry. "
+            "Only when all three are exhausted does the stage count as failed."
+        ),
+    )
+    stages.add_argument(
+        "--max-metric-skips",
+        type=int,
+        default=5,
+        metavar="N",
+        help=(
+            "How many trials may be discarded because a metric failed before "
+            "the optimization gives up. Only post-baseline failures count: a "
+            "metric that fails on trial 0 is retired for the whole study and "
+            "costs no trials at all, whereas a metric that worked on trial 0 "
+            "and then fails signals that something changed, so that trial is "
+            "thrown away instead of being scored on a different metric set. "
+            "Reaching this limit stops the study cleanly - the best trial so "
+            "far is still assembled and reported. Set to 0 to never give up."
+        ),
+    )
+    stages.add_argument(
+        "--convergence-warmup",
+        type=int,
+        default=5,
+        metavar="N",
+        help=(
+            "Number of initial trials during which convergence detection is "
+            "suppressed, so a short run cannot stop on its own noise."
+        ),
     )
 
     # Optional Input Data
