@@ -1,6 +1,8 @@
 import os
 import re
+import gc
 import json
+import ctypes
 import shutil
 import subprocess
 import logging
@@ -12,14 +14,52 @@ from typing import Tuple
 
 import numpy as np
 from pathlib import Path
-from Bio import SeqIO
 
 from utils.subprocess_logger import SubprocessLogger, TIMEOUT_EXIT_CODE
 from utils.paths import RunPaths
 
 
-class BuscoFailedError(RuntimeError):
-    """Raised when every BUSCO gene-prediction backend fails or times out."""
+#: log2 fold changes are clipped to this many doublings. A collapsed assembly
+#: can be a 500-fold regression on contig count, which at weight 1 would swamp
+#: every other metric combined; the gate should reject those anyway, and past
+#: ~32x a trial is bad by any reading.
+FC_CLIP = 5.0
+
+#: Added to count-like quantities before the ratio. Several are legitimately
+#: zero on a good assembly (missing BUSCOs, multi-copy, SVs), and x/0 is not a
+#: fold change.
+FC_PSEUDOCOUNT = 1.0
+
+#: Floor for the "deficit" quantities (k-mer completeness, trans-hap rate),
+#: which reach exactly zero on a perfect assembly.
+FC_DEFICIT_FLOOR = 0.01
+
+#: Standardised scores are clipped to this many scale units. A metric whose
+#: burn-in movement was tiny can otherwise turn an ordinary trial into a
+#: 50-unit outlier purely by having a small denominator.
+Z_CLIP = 5.0
+
+#: Below this a metric did not move at all during the burn-in: it cannot tell
+#: one parameter set from another, so it is dropped rather than divided by.
+SCALE_MIN = 1e-6
+
+#: Burn-in trials a metric needs before it gets a scale.
+SCALE_MIN_OBSERVATIONS = 3
+
+
+class CompletenessFailedError(RuntimeError):
+    """
+    Raised when every gene-space completeness backend fails or times out.
+
+    The chain is compleasm, then BUSCO/metaeuk, then BUSCO/augustus; this is
+    only raised once all of them are exhausted.
+    """
+
+
+#: Retained under its old name: ``metric_stage_state.json`` files and any
+#: downstream ``except`` clauses written against the BUSCO-only implementation
+#: keep working.
+BuscoFailedError = CompletenessFailedError
 
 
 class MetricStageFailure(RuntimeError):
@@ -74,11 +114,9 @@ class AssemblyEvaluator:
 
     It integrates:
     - Assembly statistics with `gfastats`
-    - Read-to-assembly alignment with `minimap2` + `samtools sort/index`
-    - Alignment-based quality metrics with `samtools stats`
-    - Structural-variant counting with `sniffles2`, reusing that alignment
-    - Gene-space completeness with `BUSCO`
+    - Gene-space completeness with `compleasm`, falling back to `BUSCO`
     - k-mer completeness and consensus QV with `yak`
+    - Hi-C phasing consistency with `minimap2` + `samtools` (Hi-C runs only)
 
     All intermediate artefacts are written beneath ``paths.work_dir``; nothing
     is written relative to the current working directory.
@@ -87,10 +125,9 @@ class AssemblyEvaluator:
     ------------------
     Every metric except those listed in :attr:`RAW_METRICS` is stored
     log-transformed as ``log(value + 1)``.  ``qv`` (already a Phred-scaled,
-    i.e. logarithmic, quantity), ``kmer_completeness`` (a bounded percentage)
-    and the rate-like ``samtools stats`` values are stored raw:
-    log-transforming them would compress their variance to the point of
-    invisibility next to ``n50``.
+    i.e. logarithmic, quantity) and the bounded percentages
+    (``kmer_completeness``, ``trans_hap_rate``) are stored raw: log-transforming
+    them would compress their variance to the point of invisibility.
 
     Use :meth:`raw_value` to undo the transform for display; the optimiser
     always consumes the stored (log) values.
@@ -99,13 +136,19 @@ class AssemblyEvaluator:
     #: metrics that are NOT log-transformed
     RAW_METRICS = frozenset(
         {
+            # QV is already logarithmic by construction (Phred), so logging it
+            # again would be a double transform.
             "qv",
             "kmer_completeness",
-            # samtools stats: rates / averages, meaningless under log(v+1)
-            "error_rate",
-            "mapped_rate",
-            "average_read_length",
-            "average_quality",
+            # Hi-C phasing: a percentage, like kmer_completeness.
+            "trans_hap_rate",
+            # Per-haplotype assembly lengths, reported in Mb for the log.
+            "hap1_length_mb",
+            "hap2_length_mb",
+            "qv_hap1",
+            "qv_hap2",
+            "kmer_completeness_hap1",
+            "kmer_completeness_hap2",
         }
     )
 
@@ -115,11 +158,27 @@ class AssemblyEvaluator:
         "n50": "bp",
         "qv": "Phred",
         "kmer_completeness": "%",
-        "error_rate": "per kb",
-        "mapped_rate": "%",
-        "average_read_length": "bp",
-        "bases_mapped": "bp",
+        "trans_hap_rate": "%",
+        "hic_pairs_informative": "pairs",
+        "hap1_length_mb": "Mb",
+        "hap2_length_mb": "Mb",
+        "qv_hap1": "Phred",
+        "qv_hap2": "Phred",
+        "kmer_completeness_hap1": "%",
+        "kmer_completeness_hap2": "%",
+        "num_contigs_hap1": "",
+        "num_contigs_hap2": "",
+        "n50_hap1": "bp",
+        "n50_hap2": "bp",
+        "length_diff_hap1": "Mb",
+        "length_diff_hap2": "Mb",
     }
+
+    #: Metrics that are scored per haplotype when a second haplotype exists.
+    #: Splitting them is what stops a good hap1 hiding a poor hap2: a summary
+    #: across haplotypes lets one make up for the other, whereas two separate
+    #: penalties cannot cancel.
+    HAPLOTYPE_SPLIT_METRICS = ("num_contigs", "n50", "length_diff")
 
     # ------------------------------------------------------------ transforms
     @classmethod
@@ -151,54 +210,54 @@ class AssemblyEvaluator:
         MetricStage(
             name="gfastats",
             label="assembly statistics (gfastats)",
-            metrics=("num_contigs", "length_diff", "n50"),
+            metrics=(
+                "num_contigs",
+                "length_diff",
+                "n50",
+                "num_contigs_hap1",
+                "num_contigs_hap2",
+                "n50_hap1",
+                "n50_hap2",
+                "length_diff_hap1",
+                "length_diff_hap2",
+                "hap1_length_mb",
+                "hap2_length_mb",
+            ),
             walltime_flag="--gfastats-walltime",
             # Contig count, length and N50 are the backbone of the objective.
             # Continuing without them would be optimising nothing.
             essential=True,
         ),
         MetricStage(
-            name="alignment",
-            label="read alignment (minimap2 | samtools sort)",
-            walltime_flag="--align-walltime",
-        ),
-        MetricStage(
-            name="samtools_stats",
-            label="alignment statistics (samtools stats)",
-            metrics=(
-                "reads_mapped",
-                "supplementary_alignments",
-                "error_rate",
-                "reads_total",
-                "reads_unmapped",
-                "reads_mq0",
-                "bases_mapped",
-                "mismatches",
-                "mapped_rate",
-                "average_read_length",
-                "average_quality",
-            ),
-            requires=("alignment",),
-            walltime_flag="--samtools-stats-walltime",
-        ),
-        MetricStage(
-            name="sniffles",
-            label="structural variants (sniffles2)",
-            metrics=("num_sv",),
-            requires=("alignment",),
-            walltime_flag="--sniffles-walltime",
-        ),
-        MetricStage(
             name="yak",
             label="k-mer QV and completeness (yak)",
-            metrics=("qv", "kmer_completeness"),
+            metrics=(
+                "qv",
+                "kmer_completeness",
+                "qv_hap1",
+                "qv_hap2",
+                "kmer_completeness_hap1",
+                "kmer_completeness_hap2",
+            ),
             walltime_flag="--yak-walltime",
         ),
+        # Named "busco" for continuity: the name is the key in
+        # metric_stage_state.json and in the backend cache, and renaming it
+        # would silently un-retire the stage in every existing output
+        # directory. The tool behind it is compleasm first, BUSCO second.
         MetricStage(
             name="busco",
-            label="gene-space completeness (BUSCO)",
+            label="gene-space completeness (compleasm, falling back to BUSCO)",
             metrics=("single_copy", "multi_copy", "fragmented", "missing"),
             walltime_flag="--busco-walltime",
+        ),
+        # Only runs when --hic1/--hic2 are given: without Hi-C reads there is
+        # nothing to measure and no phasing parameters being tuned.
+        MetricStage(
+            name="hic_phasing",
+            label="Hi-C phasing consistency (minimap2 + samtools)",
+            metrics=("trans_hap_rate", "hic_pairs_informative"),
+            walltime_flag="--hic-phasing-walltime",
         ),
     )
 
@@ -207,11 +266,9 @@ class AssemblyEvaluator:
     #: default per-stage wall-clock budgets, in hours (CLI overrides these)
     DEFAULT_STAGE_WALLTIMES = {
         "gfastats": 0.5,
-        "alignment": 6.0,
-        "samtools_stats": 1.0,
-        "sniffles": 2.0,
         "yak": 2.0,
         "busco": 6.0,
+        "hic_phasing": 4.0,
     }
 
     def __init__(
@@ -229,6 +286,16 @@ class AssemblyEvaluator:
         yak_bloom_bits=37,
         stage_walltimes=None,
         failure_policy=None,
+        compleasm_bin=None,
+        compleasm_download_path=None,
+        use_compleasm=True,
+        subset_seed=42,
+        hic1=None,
+        hic2=None,
+        num_hic_reads=1_000_000,
+        hic_min_mapq=20,
+        hic_phasing=True,
+        n_haplotypes=1,
     ):
         """
         Args:
@@ -241,7 +308,17 @@ class AssemblyEvaluator:
                 ``paths.busco_downloads_dir`` is used.
             ont: Input reads are ONT (selects the minimap2 preset).
             kmer_eval: Enable the yak QV / k-mer completeness metrics.
-            include_busco: Enable the BUSCO completeness metrics.
+            include_busco: Enable the gene-space completeness metrics
+                (compleasm or BUSCO). Named for the ``--no-busco`` flag it
+                backs.
+            compleasm_bin: Path to the ``compleasm`` executable. When None it
+                is discovered; see :meth:`_discover_compleasm`.
+            compleasm_download_path: compleasm lineage library. When None,
+                ``paths.compleasm_downloads_dir`` is used.
+            use_compleasm: Try compleasm before BUSCO. Set False to go
+                straight to BUSCO (``--no-compleasm``).
+            subset_seed: Seed for the read subsample, so a re-run against the
+                same reads produces the same subset.
             stage_walltimes: ``{stage_name: hours}`` overriding
                 :attr:`DEFAULT_STAGE_WALLTIMES`. A value of ``None`` or 0
                 means "no limit".
@@ -260,6 +337,16 @@ class AssemblyEvaluator:
         self.yak_k = yak_k
         self.yak_bloom_bits = yak_bloom_bits
         self._failure_policy = failure_policy
+        self.use_compleasm = use_compleasm
+        self.subset_seed = subset_seed
+        self.hic1 = Path(hic1) if hic1 else None
+        self.hic2 = Path(hic2) if hic2 else None
+        self.num_hic_reads = num_hic_reads
+        self.hic_min_mapq = hic_min_mapq
+        self.hic_phasing = hic_phasing
+        # 2 for Hi-C / ultra-long runs, which produce hap1 and hap2. Decides
+        # whether the split metrics are scored per haplotype or unsuffixed.
+        self.n_haplotypes = max(1, int(n_haplotypes))
 
         self.stage_walltimes = dict(self.DEFAULT_STAGE_WALLTIMES)
         self.stage_walltimes.update(
@@ -272,6 +359,19 @@ class AssemblyEvaluator:
             if download_path
             else paths.busco_downloads_dir
         )
+        # compleasm keeps its lineages miniprot-indexed and in its own layout,
+        # so it gets a separate directory even when the user supplied one for
+        # BUSCO. Pointing compleasm at a BUSCO download path makes it
+        # re-download rather than fail, which is merely wasteful, but keeping
+        # them apart means neither tool ever sees the other's half-written
+        # files.
+        self.compleasm_download_path = (
+            Path(compleasm_download_path).resolve()
+            if compleasm_download_path
+            else paths.compleasm_downloads_dir
+        )
+        self._compleasm_bin = compleasm_bin
+        self._compleasm_resolved = False
 
         self.subprocess_logger = SubprocessLogger(logs_dir=paths.logs_dir)
         # `trial_id or 'main'` mislabelled trial 0 -- which is the default-
@@ -294,14 +394,44 @@ class AssemblyEvaluator:
         self.stage_state = self._read_json(
             self.paths.metric_stage_state, "metric stage state"
         )
+        # The default-parameter assembly every trial is scored against. Empty
+        # until trial 0 has been measured.
+        self.baseline_metrics = self._read_json(
+            self.paths.baseline_metrics, "baseline metrics"
+        )
+        # How far each metric typically moves, measured over the burn-in.
+        # Empty during the burn-in itself.
+        self.metric_scales = self._read_json(
+            self.paths.metric_scales, "metric scales"
+        )
         #: per-evaluation outcome, ``{stage_name: bool}``; reset by
         #: :meth:`evaluate_assembly`
         self.stage_outcomes = {}
 
     # ------------------------------------------------------------------ misc
-    @property
-    def subset_reads(self) -> Path:
-        return self.paths.subset_reads
+    def _release_memory(self, context=""):
+        """
+        Collect garbage and hand freed arenas back to the kernel.
+
+        ``gc.collect()`` alone is not enough. CPython returns freed blocks to
+        glibc's allocator, which keeps them in per-arena free lists rather than
+        ``munmap``-ing them, so RSS stays at its high-water mark for the life
+        of the process even when nothing is referenced any more. The optimiser
+        then looks like it is leaking when it is only failing to give memory
+        back -- and that unreturned memory is exactly what a completeness run
+        collides with fifty trials later.
+
+        ``malloc_trim(0)`` is glibc-specific; on anything else the lookup fails
+        and only the ``gc.collect()`` takes effect, which is the correct
+        degradation.
+        """
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            return
+        if context:
+            self.logger.debug(f"Released allocator arenas after {context}")
 
     @property
     def trial_dir(self) -> Path:
@@ -351,6 +481,15 @@ class AssemblyEvaluator:
         self.backend_cache = self._read_json(
             self.cache_path, "BUSCO backend cache"
         )
+        # Trial 0 writes this after the long-lived evaluator was built, so
+        # without picking it up here the final assembly would have no baseline
+        # to compare against.
+        self.baseline_metrics = self._read_json(
+            self.paths.baseline_metrics, "baseline metrics"
+        )
+        self.metric_scales = self._read_json(
+            self.paths.metric_scales, "metric scales"
+        )
         return self.stage_state
 
     def _save_stage_state(self):
@@ -380,6 +519,11 @@ class AssemblyEvaluator:
             return not self.kmer_eval
         if name == "busco":
             return not self.include_busco
+        if name == "hic_phasing":
+            # Also the "no Hi-C data" case: not having run Hi-C is a choice
+            # about the experiment, not a stage failing, so it is reported
+            # the same way as an explicit --no-hic-phasing.
+            return not (self.hic_phasing and self.hic1 and self.hic2)
         return False
 
     def stage_enabled(self, name) -> bool:
@@ -389,9 +533,7 @@ class AssemblyEvaluator:
         Covers four reasons a stage may be off: the user disabled it
         (``--no-busco`` / ``--no-kmer-eval``), it failed often enough to be
         retired, a stage it *depends on* was retired, or it is not a real
-        stage name. The dependency case matters: ``alignment`` produces no
-        metrics of its own, so losing it would otherwise leave samtools stats
-        and sniffles nominally "enabled" while producing nothing.
+        stage name.
         """
         stage = self.STAGES_BY_NAME.get(name)
         if stage is None:
@@ -692,14 +834,6 @@ class AssemblyEvaluator:
             "n50": re.compile(r"Contig N50:\s+(\d+)"),
         }
 
-        # `samtools stats` summary-number lines look like:
-        #     SN\treads mapped:\t98213\t# comment
-        # The value may be an integer, a float, or scientific notation
-        # ("error rate:\t2.383865e-03").
-        self.samtools_sn = re.compile(
-            r"^SN\t([^:]+):\t([-+0-9.eE]+)", re.MULTILINE
-        )
-
     def run_command(
         self, command, command_name="command", timeout_seconds=None, cwd=None
     ):
@@ -754,91 +888,63 @@ class AssemblyEvaluator:
 
     # ------------------------------------------------------------------ setup
     def download_busco(self, lineage="metazoa_odb12"):
-        """Download the BUSCO lineage dataset into the work/ tree if absent."""
+        """
+        Download the BUSCO lineage dataset into the work/ tree if absent.
+
+        Called from setup when BUSCO is the primary backend, and lazily from
+        the completeness chain when a compleasm failure sends it to BUSCO for
+        the first time.
+        """
         if not self.stage_enabled("busco"):
             self.logger.info(
-                "BUSCO is disabled for this run; skipping the lineage download."
+                "Completeness scoring is disabled for this run; skipping the "
+                "BUSCO lineage download."
             )
             return None
 
         lineage_dir = self.download_path / "lineages" / lineage
         if lineage_dir.exists():
-            self.logger.info(
-                f"BUSCO lineage '{lineage}' already present in {self.download_path}. "
-                "Skipping download."
+            self.logger.debug(
+                f"BUSCO lineage '{lineage}' already present in {self.download_path}."
             )
-            return
+            return lineage_dir
 
         self.download_path.mkdir(parents=True, exist_ok=True)
         command = f"busco --download_path {self.download_path} --download {lineage}"
         try:
-            return self.run_command(command, command_name="busco_download")
+            self.run_command(command, command_name="busco_download")
         except Exception as e:
             self.logger.error(f"BUSCO download failed: {e}")
             raise
+        return lineage_dir
 
-    def read_subsetting(self, num_reads):
+    def prepare_completeness_dataset(self, lineage="metazoa_odb12"):
         """
-        Subsample a **fixed number** of reads (``num_reads``, i.e.
-        ``--num-reads``) from the input file into ``work/reads/subset_reads.fa``.
+        Fetch the lineage for whichever backend will actually run first.
 
-        This is a fixed *count*, not a coverage target: the resulting depth
-        depends on the read-length distribution and the genome size. The
-        implied coverage is computed from the sampled bases and logged below
-        so that ``--num-reads`` can be tuned against it.
-
-        The subset is always written as FASTA regardless of input format: the
-        downstream consumers (minimap2, sniffles) do not use base qualities,
-        and a fixed filename keeps every trial pointing at the same file.
+        Downloading both formats costs a few hundred megabytes and several
+        minutes for a dataset that may never be touched, so only the primary
+        is fetched here. If compleasm later fails, the completeness chain
+        downloads the BUSCO lineage on its way to the fallback.
         """
-        fname = self.input_reads.name
-
-        if fname.endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz")):
-            fmt = "fastq"
-        elif fname.endswith((".fasta", ".fa", ".fasta.gz", ".fa.gz")):
-            fmt = "fasta"
-        else:
-            raise ValueError(
-                f"Input file {fname} is not in a recognized FASTA or FASTQ format."
+        if not self.stage_enabled("busco"):
+            self.logger.info(
+                "Completeness scoring is disabled for this run; skipping the "
+                "lineage download."
             )
+            return None
 
-        open_func = gzip.open if fname.endswith(".gz") else open
-
-        with open_func(self.input_reads, "rt") as handle:
-            records = list(SeqIO.parse(handle, fmt))
-        sampled = random.sample(records, min(num_reads, len(records)))
-
-        self.subset_reads.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.subset_reads, "wt") as out_handle:
-            SeqIO.write(sampled, out_handle, "fasta")
-
-        sampled_bases = sum(len(r.seq) for r in sampled)
-        mean_len = sampled_bases / len(sampled) if sampled else 0
-        coverage = (
-            sampled_bases / self.known_genome_size if self.known_genome_size else 0
-        )
-
-        self.logger.info(
-            f"Read subsetting: fixed count of {num_reads} requested "
-            f"(--num-reads), {len(sampled)} of {len(records)} available reads "
-            f"written to {self.subset_reads}"
-        )
-        self.logger.info(
-            f"  Sampled bases      : {sampled_bases / 1e6:.1f} Mb "
-            f"(mean read length {mean_len:,.0f} bp)"
-        )
-        self.logger.info(
-            f"  Implied coverage   : ~{coverage:.1f}x of a "
-            f"{self.known_genome_size / 1e6:.0f} Mb haploid genome"
-        )
-
-        if coverage < 10:
-            self.logger.warning(
-                f"The read subset gives only ~{coverage:.1f}x coverage. The "
-                "alignment-based metrics (samtools stats, sniffles) become "
-                "noisy below ~10x; raise --num-reads if the per-trial scores "
-                "look unstable."
+        if self.compleasm_available():
+            self.logger.info(
+                f"Preparing compleasm lineage '{lineage}' (primary backend). "
+                "The BUSCO lineage is fetched only if compleasm fails."
             )
+            return self.download_compleasm_lineage(lineage=lineage)
+
+        self.logger.info(
+            f"Preparing BUSCO lineage '{lineage}' (compleasm unavailable)."
+        )
+        return self.download_busco(lineage=lineage)
 
     # ------------------------------------------------------------------- yak
     def build_read_kmer_db(self, force=False):
@@ -992,45 +1098,135 @@ class AssemblyEvaluator:
             timeout_seconds=self.stage_walltime_seconds("yak"),
         )
         primary = self.parse_yak_qv(qv_out)
+        extra_fasta_files = [f for f in (extra_fasta_files or []) if Path(f).exists()]
+
+        if not extra_fasta_files:
+            return primary
+
+        primary["qv_hap1"] = primary["qv"]
+        primary["kmer_completeness_hap1"] = primary["kmer_completeness"]
+
+        # --- second haplotype, measured on its own ---
+        # Consensus accuracy and k-mer completeness are both per-haplotype
+        # quantities, so with two haplotypes there are two of each and scoring
+        # only the first leaves hap2 out of the objective entirely.
+        hap2_out = tdir / "yak_qv.hap2.txt"
+        self.run_command(
+            f"yak qv -t{self.threads} -K{chunk} "
+            f"{self.paths.reads_yak} {extra_fasta_files[0]} > {hap2_out}",
+            command_name="yak_qv_hap2",
+            timeout_seconds=self.stage_walltime_seconds("yak"),
+        )
+        hap2 = self.parse_yak_qv(hap2_out)
+        primary["qv_hap2"] = hap2["qv"]
+        primary["kmer_completeness_hap2"] = hap2["kmer_completeness"]
+        primary["qv"] = (primary["qv_hap1"] + hap2["qv"]) / 2.0
 
         # --- completeness on the full (diploid) assembly ---
-        extra_fasta_files = [f for f in (extra_fasta_files or []) if Path(f).exists()]
-        if extra_fasta_files:
-            combined = self._combine_fastas(
-                [fasta_file] + list(extra_fasta_files), tdir / "combined_haps.fasta"
-            )
-            comb_out = tdir / "yak_qv.combined.txt"
-            command = (
-                f"yak qv -t{self.threads} -K{chunk * 2} "
-                f"{self.paths.reads_yak} {combined} > {comb_out}"
-            )
-            self.run_command(
-                command,
-                command_name="yak_qv_combined",
-                timeout_seconds=self.stage_walltime_seconds("yak"),
-            )
-            combined_stats = self.parse_yak_qv(comb_out)
-            primary["kmer_completeness"] = combined_stats["kmer_completeness"]
-            try:
-                combined.unlink()
-            except Exception:
-                pass
+        # Kept alongside the per-haplotype figures rather than replaced by
+        # them. Per-haplotype completeness is structurally capped by
+        # heterozygosity and is *higher* for a collapsed assembly that packed
+        # both alleles into one haplotype, so on its own it rewards exactly
+        # the failure mode Hi-C phasing is meant to avoid. The combined figure
+        # is the only metric here that penalises that collapse.
+        combined = self._combine_fastas(
+            [fasta_file] + list(extra_fasta_files), tdir / "combined_haps.fasta"
+        )
+        comb_out = tdir / "yak_qv.combined.txt"
+        self.run_command(
+            f"yak qv -t{self.threads} -K{chunk * 2} "
+            f"{self.paths.reads_yak} {combined} > {comb_out}",
+            command_name="yak_qv_combined",
+            timeout_seconds=self.stage_walltime_seconds("yak"),
+        )
+        primary["kmer_completeness"] = self.parse_yak_qv(comb_out)[
+            "kmer_completeness"
+        ]
+        try:
+            combined.unlink()
+        except Exception:
+            pass
 
         return primary
 
     # ---------------------------------------------------------------- gfastats
-    def run_gfastats(self, gfa_file):
-        command = f"gfastats --discover-paths {gfa_file}"
-        try:
-            stdout = self.run_command(
-                command,
-                "gfastats",
-                timeout_seconds=self.stage_walltime_seconds("gfastats"),
-            )
-            return self.parse_gfastats_output(stdout)
-        except (RuntimeError, TimeoutError):
-            self.logger.error("gfastats analysis failed")
-            raise
+    def run_gfastats(self, gfa_file, extra_gfa_files=None):
+        """
+        Assembly statistics, over every haplotype rather than just the first.
+
+        With a second haplotype present, scoring hap1 alone leaves half the
+        assembly unmeasured: hap2's contig count, N50 and length never enter
+        the objective, so a parameter set that builds a good hap1 and a poor
+        hap2 scores the same as one that builds two good haplotypes.
+
+        The three scored numbers are reduced across haplotypes as:
+
+        ``num_contigs``  summed  -- fragmentation anywhere is fragmentation
+        ``n50``          mean    -- so one contiguous haplotype cannot hide
+                                    a shattered one
+        ``length_diff``  mean of each haplotype's own deviation from the
+                         *haploid* genome size, which is the size each
+                         haplotype should individually be
+
+        The individual haplotype lengths are also returned, unweighted, so the
+        log shows both rather than only their summary.
+        """
+        gfas = [Path(gfa_file)] + [
+            Path(f) for f in (extra_gfa_files or []) if Path(f).exists()
+        ]
+
+        per_hap = []
+        for index, gfa in enumerate(gfas, start=1):
+            # A distinct command_name per haplotype is load-bearing, not
+            # cosmetic. run_command returns the *contents of the log file*, and
+            # the subprocess logger opens it in append mode, so two runs
+            # sharing a name write into one file. parse_gfastats_output uses
+            # re.search, which returns the first match -- so hap2 would be
+            # parsed out of hap1's output and both haplotypes would report
+            # identical contig counts, N50 and length.
+            name = "gfastats" if len(gfas) == 1 else f"gfastats_hap{index}"
+            try:
+                stdout = self.run_command(
+                    f"gfastats --discover-paths {gfa}",
+                    name,
+                    timeout_seconds=self.stage_walltime_seconds("gfastats"),
+                )
+            except (RuntimeError, TimeoutError):
+                self.logger.error(f"gfastats analysis failed for {gfa.name}")
+                raise
+            per_hap.append(self.parse_gfastats_output(stdout))
+
+        return self.combine_gfastats(per_hap)
+
+    @classmethod
+    def combine_gfastats(cls, per_hap):
+        """
+        Turn per-haplotype gfastats dicts into the scored metric set.
+
+        With one haplotype the metric names are unsuffixed and nothing about
+        scoring changes. With two, ``num_contigs``, ``n50`` and ``length_diff``
+        are emitted *per haplotype* (``n50_hap1``, ``n50_hap2``, ...) and the
+        unsuffixed names are not produced at all.
+
+        Splitting rather than summarising is the point: a mean N50 lets one
+        contiguous haplotype hide a shattered one, and a mean length deviation
+        lets +10 Mb on hap1 cancel -10 Mb on hap2. Two separate penalties
+        cannot cancel each other.
+        """
+        if not per_hap:
+            raise RuntimeError("gfastats produced no output for any haplotype")
+
+        metrics = {}
+        single = len(per_hap) == 1
+
+        for index, hap in enumerate(per_hap, start=1):
+            suffix = "" if single else f"_hap{index}"
+            for key in cls.HAPLOTYPE_SPLIT_METRICS:
+                if key in hap:
+                    metrics[f"{key}{suffix}"] = float(hap[key])
+            if "total_length" in hap and index <= 2:
+                metrics[f"hap{index}_length_mb"] = hap["total_length"] / 1e6
+        return metrics
 
     def parse_gfastats_output(self, output):
         metrics = {}
@@ -1039,6 +1235,9 @@ class AssemblyEvaluator:
             if match:
                 value = int(match.group(1))
                 if key == "length_diff":
+                    # Kept alongside the log-scaled deviation so the log can
+                    # show what each haplotype actually measured, in Mb.
+                    metrics["total_length"] = float(value)
                     metrics[key] = np.log(
                         (abs(value - self.known_genome_size) / 1_000_000) + 1
                     )
@@ -1081,22 +1280,273 @@ class AssemblyEvaluator:
             subprocess.run(command, stdout=out_file, check=True)
         return True
 
-    # ------------------------------------------------------------------ BUSCO
-    #: attempted in order; the first that succeeds is cached for later trials
-    BUSCO_BACKENDS = ("miniprot", "metaeuk", "augustus")
+    # ----------------------------------------------------- gene completeness
+    #: Completeness backends, attempted in this order. compleasm is a
+    #: miniprot-based reimplementation of BUSCO and is both faster and far
+    #: lighter on memory, which is why it leads. BUSCO's own miniprot backend
+    #: is deliberately absent: it would re-run the same aligner compleasm
+    #: already tried, so a compleasm failure tells us nothing new about it.
+    #: metaeuk and augustus are genuinely different gene finders and are worth
+    #: the fallback.
+    COMPLETENESS_BACKENDS = ("compleasm", "busco:metaeuk", "busco:augustus")
 
-    def run_busco(self, fasta_file, lineage="metazoa_odb12", mode="genome"):
+    #: BUSCO gene predictors reachable as a fallback, in order of cost
+    BUSCO_BACKENDS = ("metaeuk", "augustus")
+
+    # ------------------------------------------------------ compleasm lookup
+    def _discover_compleasm(self):
         """
-        Run BUSCO, trying gene-prediction backends in order of increasing cost.
+        Locate the ``compleasm`` executable.
 
-        Miniprot has been the default for eukaryotic genome mode since BUSCO
-        v5.7.0 and is typically minutes rather than hours; metaeuk and augustus
-        are only reached if it fails.  Whichever backend succeeds is recorded
-        in the backend cache so subsequent trials do not re-pay for the
-        failures.
+        compleasm and BUSCO cannot share a conda environment -- their pinned
+        dependencies conflict -- so compleasm is installed into a *separate*
+        environment and is not on the optimiser's own PATH. Search order:
 
-        Each attempt is bounded by ``--busco-walltime``, enforced by
-        ``SubprocessLogger`` killing the whole process group.  GNU ``timeout``
+        1. an explicit ``--compleasm-bin`` / constructor argument
+        2. ``$COMPLEASM_BIN`` (what the Docker/Singularity image sets)
+        3. ``compleasm`` on PATH, for anyone who did get them co-installed
+        4. a sibling conda environment named ``compleasm``, resolved relative
+           to the running interpreter, which covers a local ``conda create``
+        5. the image's canonical location
+
+        Returns:
+            ``Path`` to the executable, or None if nothing was found.
+        """
+        candidates = []
+        if self._compleasm_bin:
+            candidates.append(Path(self._compleasm_bin))
+
+        env_bin = os.environ.get("COMPLEASM_BIN")
+        if env_bin:
+            candidates.append(Path(env_bin))
+
+        on_path = shutil.which("compleasm")
+        if on_path:
+            candidates.append(Path(on_path))
+
+        # sys.prefix is .../envs/optimizer; its sibling is .../envs/compleasm
+        import sys
+
+        sibling = Path(sys.prefix).parent / "compleasm" / "bin" / "compleasm"
+        candidates.append(sibling)
+        candidates.append(Path("/opt/conda/envs/compleasm/bin/compleasm"))
+
+        for candidate in candidates:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate.resolve()
+        return None
+
+    @property
+    def compleasm_bin(self):
+        """Cached result of :meth:`_discover_compleasm` (None if unavailable)."""
+        if not self._compleasm_resolved:
+            self._compleasm_bin = self._discover_compleasm()
+            self._compleasm_resolved = True
+            if self._compleasm_bin:
+                self.logger.info(f"Using compleasm at {self._compleasm_bin}")
+            else:
+                self.logger.info(
+                    "compleasm not found; gene-space completeness will use "
+                    "BUSCO. Set --compleasm-bin or $COMPLEASM_BIN to point at "
+                    "it, or install it into a conda environment named "
+                    "'compleasm' alongside this one."
+                )
+        return self._compleasm_bin
+
+    def _compleasm_env_prefix(self):
+        """
+        ``PATH=...`` prefix that puts compleasm's own environment first.
+
+        compleasm shells out to ``miniprot`` and ``hmmsearch`` by bare name.
+        Running the executable by absolute path is not enough: without this
+        prefix it would find the *optimiser* environment's miniprot, which is
+        a different build pinned against BUSCO's dependency set. Prepending
+        rather than replacing keeps ``sh``, ``awk`` and friends resolvable.
+        """
+        bin_dir = self.compleasm_bin.parent
+        return f"PATH={bin_dir}:$PATH "
+
+    def compleasm_available(self) -> bool:
+        """True if compleasm should and can be used."""
+        return bool(self.use_compleasm and self.compleasm_bin)
+
+    # ---------------------------------------------------------- compleasm run
+    def download_compleasm_lineage(self, lineage="metazoa_odb12"):
+        """
+        Fetch the compleasm lineage library if it is not already present.
+
+        compleasm downloads on demand during ``run``, but doing it here keeps
+        a slow first download out of the per-attempt walltime, where it would
+        look like a hung gene predictor.
+        """
+        if not self.compleasm_available():
+            return None
+
+        lineage_dir = self.compleasm_download_path / lineage
+        if lineage_dir.exists() and any(lineage_dir.iterdir()):
+            self.logger.info(
+                f"compleasm lineage '{lineage}' already present in "
+                f"{self.compleasm_download_path}. Skipping download."
+            )
+            return lineage_dir
+
+        self.compleasm_download_path.mkdir(parents=True, exist_ok=True)
+        command = (
+            f"{self._compleasm_env_prefix()}{self.compleasm_bin} download "
+            f"{lineage} -L {self.compleasm_download_path}"
+        )
+        self.logger.info(f"Downloading compleasm lineage '{lineage}'")
+        self.run_command(command, command_name="compleasm_download")
+        return lineage_dir
+
+    def run_compleasm(self, fasta_file, lineage="metazoa_odb12"):
+        """
+        Score gene-space completeness with compleasm.
+
+            compleasm run -a <asm.fa> -o <outdir> -l <lineage> -t N -L <lib>
+
+        compleasm writes ``<outdir>/summary.txt``, which
+        :meth:`parse_compleasm_summary` reads. Bounded by ``--busco-walltime``
+        like every other completeness attempt.
+        """
+        if not self.compleasm_available():
+            raise RuntimeError("compleasm is not available in this environment")
+
+        out_dir = self.trial_dir / "compleasm_output"
+        # compleasm appends to an existing run directory rather than replacing
+        # it, so a stale directory from a killed attempt would be read back as
+        # if it were this trial's result.
+        if out_dir.exists():
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+        command = (
+            f"{self._compleasm_env_prefix()}{self.compleasm_bin} run "
+            f"-a {fasta_file} -o {out_dir} -l {lineage} "
+            f"-t {self.threads} -L {self.compleasm_download_path}"
+        )
+
+        self.logger.info(
+            f"Running compleasm (walltime: {self.stage_walltimes.get('busco')} h)"
+        )
+        self.run_command(
+            command,
+            command_name="compleasm",
+            timeout_seconds=self.stage_walltime_seconds("busco"),
+        )
+
+        summary = out_dir / "summary.txt"
+        if not summary.exists():
+            matches = list(out_dir.glob("**/summary.txt"))
+            if not matches:
+                raise FileNotFoundError(
+                    f"compleasm finished but no summary.txt was written under {out_dir}"
+                )
+            summary = matches[0]
+
+        return self.parse_compleasm_summary(summary)
+
+    #: ``S:90.03%, 605`` -- category, percentage, count
+    _COMPLEASM_CATEGORY = re.compile(
+        r"^\s*([SDFIM])\s*:\s*([\d.]+)\s*%\s*,\s*(\d+)\s*$", re.MULTILINE
+    )
+    #: ``N:672`` -- total markers in the lineage
+    _COMPLEASM_TOTAL = re.compile(r"^\s*N\s*:\s*(\d+)\s*$", re.MULTILINE)
+
+    @classmethod
+    def parse_compleasm_summary(cls, summary_file):
+        """
+        Parse compleasm's ``summary.txt`` into the BUSCO metric schema.
+
+        The file looks like::
+
+            ## lineage: metazoa_odb12
+            S:90.03%, 605
+            D:5.51%, 37
+            F:2.38%, 16
+            I:0.00%, 0
+            M:2.08%, 14
+            N:672
+
+        Category mapping
+        ----------------
+        ``S``, ``D`` and ``M`` map straight onto ``single_copy``,
+        ``multi_copy`` and ``missing``. ``I`` has no BUSCO equivalent:
+        compleasm splits partially recovered markers into *fragmented* (a
+        truncated alignment) and *incomplete* (a gene found, but not to the
+        completeness threshold), where BUSCO reports both as ``Fragmented``.
+        ``I`` is therefore folded into ``fragmented``, which keeps
+        ``S + D + F + M == N`` and keeps a compleasm-scored trial comparable
+        with a BUSCO-scored one. It also keeps the four counts summing to the
+        marker total, which is what ``format_metrics`` divides by to get the
+        percentages it prints.
+
+        Counts are stored log-transformed, exactly as
+        :meth:`parse_busco_results` does, so nothing downstream can tell which
+        tool produced them.
+
+        Raises:
+            ValueError: if no category line parsed, so that a truncated or
+                reformatted summary triggers the BUSCO fallback instead of
+                silently scoring the trial as 100% missing.
+        """
+        text = Path(summary_file).read_text()
+
+        counts = {}
+        for category, _pct, count in cls._COMPLEASM_CATEGORY.findall(text):
+            counts[category] = int(count)
+
+        if not counts:
+            raise ValueError(
+                f"No S/D/F/I/M category lines found in {summary_file}; "
+                "compleasm's output format may have changed."
+            )
+
+        missing_categories = {"S", "D", "F", "M"} - counts.keys()
+        if missing_categories:
+            raise ValueError(
+                f"compleasm summary {summary_file} is missing the "
+                f"{', '.join(sorted(missing_categories))} categor"
+                f"{'y' if len(missing_categories) == 1 else 'ies'}."
+            )
+
+        single = counts["S"]
+        duplicated = counts["D"]
+        # "Incomplete" is compleasm-only; see the docstring.
+        fragmented = counts["F"] + counts.get("I", 0)
+        absent = counts["M"]
+
+        total_match = cls._COMPLEASM_TOTAL.search(text)
+        if total_match:
+            total = int(total_match.group(1))
+            summed = single + duplicated + fragmented + absent
+            if total and summed != total:
+                logging.getLogger(__name__).warning(
+                    f"compleasm categories sum to {summed} but the lineage has "
+                    f"{total} markers ({summary_file}); percentages in the "
+                    "metric summary will be computed against the sum."
+                )
+
+        return {
+            "single_copy": np.log(single + 1),
+            "multi_copy": np.log(duplicated + 1),
+            "fragmented": np.log(fragmented + 1),
+            "missing": np.log(absent + 1),
+        }
+
+    # -------------------------------------------------------------- BUSCO run
+    def run_busco(
+        self, fasta_file, lineage="metazoa_odb12", mode="genome", backend="metaeuk"
+    ):
+        """
+        Run BUSCO once, with an explicit gene predictor.
+
+        Backend selection has moved up into :meth:`run_completeness`, which
+        walks compleasm and the BUSCO predictors as one ordered chain. This
+        method performs a single attempt so that the caller decides what a
+        failure means.
+
+        The attempt is bounded by ``--busco-walltime``, enforced by
+        ``SubprocessLogger`` killing the whole process group. GNU ``timeout``
         is deliberately *not* used: it signals only the direct child, leaving
         BUSCO's metaeuk/augustus/hmmsearch grandchildren running.
         """
@@ -1105,51 +1555,22 @@ class AssemblyEvaluator:
         out_dir = tdir / out_name
 
         # BUSCO's -o must be a bare name; the location is set with --out_path.
-        base_cmd = (
+        command = (
             f"busco -i {fasta_file} -l {lineage} -m {mode} "
             f"-o {out_name} --out_path {tdir} "
             f"-c {self.threads} --skip_bbtools --force "
-            f"--download_path {self.download_path}"
+            f"--download_path {self.download_path} --{backend}"
         )
 
-        timeout_seconds = self.stage_walltime_seconds("busco")
-
-        cached = self.backend_cache.get("busco")
-        if cached in self.BUSCO_BACKENDS:
-            order = [cached] + [b for b in self.BUSCO_BACKENDS if b != cached]
-        else:
-            order = list(self.BUSCO_BACKENDS)
-
-        last_error = None
-        backend_used = None
-        for backend in order:
-            cmd = f"{base_cmd} --{backend}"
-            try:
-                self.logger.info(
-                    f"Running BUSCO with {backend} "
-                    f"(walltime: {self.stage_walltimes.get('busco')} h)"
-                )
-                self.run_command(cmd, f"busco_{backend}", timeout_seconds=timeout_seconds)
-                backend_used = backend
-                break
-            except (RuntimeError, TimeoutError) as e:
-                last_error = e
-                self.logger.warning(
-                    f"BUSCO/{backend} failed or exceeded its walltime: {e}"
-                )
-
-        if backend_used is None:
-            raise BuscoFailedError(
-                f"BUSCO failed or exceeded the {self.stage_walltimes.get('busco')} h walltime "
-                f"with every backend ({', '.join(order)}). This usually means a "
-                "gene-prediction step is hanging or broken in this environment. "
-                "Re-run with --no-busco to proceed without completeness scoring. "
-                f"Last error: {last_error}"
-            )
-
-        if self.backend_cache.get("busco") != backend_used:
-            self.backend_cache["busco"] = backend_used
-            self._save_backend_cache()
+        self.logger.info(
+            f"Running BUSCO with {backend} "
+            f"(walltime: {self.stage_walltimes.get('busco')} h)"
+        )
+        self.run_command(
+            command,
+            f"busco_{backend}",
+            timeout_seconds=self.stage_walltime_seconds("busco"),
+        )
 
         matches = list(out_dir.glob(f"short_summary.specific.{lineage}.*.json"))
         if not matches:
@@ -1171,232 +1592,332 @@ class AssemblyEvaluator:
             "missing": np.log(data["results"]["Missing BUSCOs"] + 1),
         }
 
-    # ------------------------------------------------------- read alignment
-    @property
-    def minimap2_preset(self) -> str:
-        return "map-ont" if self.ont else "map-hifi"
-
-    def align_reads(self, fasta_file, force=False):
+    # ------------------------------------------------------ completeness chain
+    def _completeness_order(self):
         """
-        Map the read subset back onto the assembly and produce a sorted,
-        indexed BAM.
+        Backends to try, best-known-working first.
 
-            minimap2 -a -x <preset> --secondary=no -t N asm.fa reads.fa
-              | samtools sort -@ N -o aln.bam -
-            samtools index aln.bam
+        The cache records whichever backend last succeeded, so a run that fell
+        through to BUSCO/augustus on trial 0 does not re-pay for the compleasm
+        and metaeuk failures on trials 1..99. Backends that cannot run at all
+        in this environment are dropped rather than ordered.
+        """
+        available = [
+            b
+            for b in self.COMPLETENESS_BACKENDS
+            if b != "compleasm" or self.compleasm_available()
+        ]
 
-        ``--secondary=no`` suppresses secondary alignments but keeps
-        *supplementary* ones, which are the split-read signal we score with
-        (and which sniffles needs). One alignment per trial serves both
-        ``samtools stats`` and sniffles.
+        cached = self.backend_cache.get("completeness")
+
+        # Cache written before compleasm existed: the key was "busco" and the
+        # value a bare predictor name. It still carries real information --
+        # "augustus" means metaeuk had already failed on this data -- so it is
+        # used to order the BUSCO entries. It does not promote BUSCO above
+        # compleasm: compleasm is a different tool and has never been tried.
+        if cached is None:
+            legacy = self.backend_cache.get("busco")
+            if legacy in self.BUSCO_BACKENDS:
+                legacy_id = f"busco:{legacy}"
+                available = [b for b in available if b != legacy_id]
+                insert_at = 1 if available and available[0] == "compleasm" else 0
+                available.insert(insert_at, legacy_id)
+            return available
+
+        if cached in available:
+            return [cached] + [b for b in available if b != cached]
+        return available
+
+    def _run_completeness_backend(self, backend, fasta_file, lineage):
+        """Dispatch one backend id from :attr:`COMPLETENESS_BACKENDS`."""
+        if backend == "compleasm":
+            return self.run_compleasm(fasta_file, lineage=lineage)
+
+        predictor = backend.split(":", 1)[1]
+        # A fallback to BUSCO needs BUSCO's own lineage format, which the
+        # compleasm-first setup path will not have fetched. Done here rather
+        # than inside the attempt so a multi-hundred-megabyte download is not
+        # charged against the gene predictor's walltime.
+        self.download_busco(lineage=lineage)
+        return self.run_busco(fasta_file, lineage=lineage, backend=predictor)
+
+    def run_completeness(self, fasta_file, lineage="metazoa_odb12"):
+        """
+        Score gene-space completeness, trying each backend in turn.
+
+        compleasm runs first: it is miniprot-based, typically minutes rather
+        than hours, and its peak memory is a fraction of a threaded metaeuk or
+        augustus run -- which matters because this stage runs last in a trial,
+        when the process is already at its high-water mark. BUSCO with metaeuk
+        and then augustus are the fallbacks. BUSCO's *own* miniprot backend is
+        not in the chain: compleasm already is miniprot, so re-running it under
+        BUSCO would buy nothing but another walltime.
+
+        Whichever backend succeeds is cached in
+        ``work/cache/busco_backend_cache.json`` so later trials start with it.
 
         Returns:
-            Path to the sorted BAM.
+            dict with ``single_copy``, ``multi_copy``, ``fragmented`` and
+            ``missing``, log-transformed, regardless of which tool ran.
+
+        Raises:
+            CompletenessFailedError: every available backend failed.
         """
-        tdir = self.trial_dir
-        bam = tdir / "reads_to_assembly.bam"
-
-        if bam.exists() and not force:
-            return bam
-
-        if not Path(self.subset_reads).exists():
-            raise FileNotFoundError(
-                f"Read subset not found at {self.subset_reads}; "
-                "read_subsetting() must run before alignment."
+        order = self._completeness_order()
+        if not order:
+            raise CompletenessFailedError(
+                "No gene-space completeness backend is available: compleasm "
+                "was not found and BUSCO is not usable. Re-run with --no-busco "
+                "to score without completeness metrics."
             )
 
-        timeout_seconds = self.stage_walltime_seconds("alignment")
-
-        # `set -o pipefail` so a minimap2 failure is not masked by a
-        # successful samtools sort of an empty stream.
-        command = (
-            f"set -o pipefail; "
-            f"minimap2 -a -x {self.minimap2_preset} --secondary=no "
-            f"-t {self.threads} {fasta_file} {self.subset_reads} "
-            f"| samtools sort -@ {self.threads} -o {bam} - "
-            f"&& samtools index -@ {self.threads} {bam}"
-        )
-
-        self.logger.info(
-            f"Aligning read subset to the assembly (minimap2 -x "
-            f"{self.minimap2_preset})"
-        )
-        try:
-            self.run_command(
-                command, "minimap2_sort", timeout_seconds=timeout_seconds
-            )
-        except (RuntimeError, TimeoutError):
-            self.logger.error("Read alignment (minimap2 | samtools sort) failed")
-            raise
-
-        if not bam.exists():
-            raise FileNotFoundError(f"Alignment finished but {bam} was not written")
-
-        return bam
-
-    # -------------------------------------------------------- samtools stats
-    def run_samtools_stats(self, bam_file):
-        """
-        Alignment-based quality metrics from ``samtools stats``.
-
-        Three of the summary numbers feed the score (see ``weights.json``):
-
-        ``reads_mapped``
-            How many of the subset reads placed on the assembly at all. The
-            subset size is constant across trials, so the raw count is
-            directly comparable; missing sequence shows up here first.
-        ``error_rate``
-            ``mismatches / bases mapped (cigar)`` -- samtools' own per-base
-            divergence between reads and assembly. A consensus-accuracy proxy
-            that, unlike a raw mismatch count, is independent of how much
-            sequence got mapped.
-        ``supplementary_alignments``
-            Split reads: one read placed in two pieces. The clearest cheap
-            signal for chimeric joins and local misassembly, and the metric
-            CRAQ's clip-based CRE/CSE was ultimately derived from.
-
-        Everything else parsed here is recorded for the log and the trial
-        attributes but carries no weight.
-
-        Returns:
-            dict of metrics. Counts are stored log-transformed; the rate-like
-            values listed in :attr:`RAW_METRICS` are stored raw.
-        """
-        stats_out = self.trial_dir / "samtools_stats.txt"
-        command = f"samtools stats -@ {self.threads} {bam_file} > {stats_out}"
-
-        try:
-            self.run_command(
-                command,
-                "samtools_stats",
-                timeout_seconds=self.stage_walltime_seconds("samtools_stats"),
-            )
-        except (RuntimeError, TimeoutError):
-            self.logger.error("samtools stats failed")
-            raise
-
-        with open(stats_out, "r") as fh:
-            return self.parse_samtools_stats(fh.read())
-
-    def parse_samtools_stats(self, output):
-        """
-        Parse the ``SN`` block of ``samtools stats`` output.
-
-        Fields consumed (samtools >= 1.10 names them all):
-            sequences, reads mapped, reads unmapped, supplementary alignments,
-            reads MQ0, bases mapped (cigar), mismatches, error rate,
-            average length, average quality
-        """
-        raw = {}
-        for match in self.samtools_sn.finditer(output):
-            key = match.group(1).strip()
+        last_error = None
+        for backend in order:
             try:
-                raw[key] = float(match.group(2))
-            except ValueError:
+                metrics = self._run_completeness_backend(
+                    backend, fasta_file, lineage
+                )
+            except (RuntimeError, TimeoutError, ValueError, FileNotFoundError) as e:
+                last_error = e
+                self.logger.warning(
+                    f"Completeness backend '{backend}' failed or exceeded its "
+                    f"walltime: {e}"
+                )
                 continue
 
-        if not raw:
-            self.logger.warning(
-                "samtools stats produced no parsable SN block; alignment "
-                "metrics unavailable for this trial."
+            if self.backend_cache.get("completeness") != backend:
+                self.backend_cache["completeness"] = backend
+                self._save_backend_cache()
+            self.logger.info(f"Gene-space completeness scored with {backend}")
+            return metrics
+
+        raise CompletenessFailedError(
+            f"Gene-space completeness failed or exceeded the "
+            f"{self.stage_walltimes.get('busco')} h walltime with every backend "
+            f"({', '.join(order)}). This usually means a gene-prediction step "
+            "is hanging or broken in this environment. Re-run with --no-busco "
+            f"to proceed without completeness scoring. Last error: {last_error}"
+        )
+
+    # ------------------------------------------------------- Hi-C phasing
+    def build_diploid_fasta(self, fasta_file, extra_fasta_files):
+        """
+        Concatenate the haplotype FASTAs, prefixing contig names by haplotype.
+
+        Contigs become ``h1_<name>`` / ``h2_<name>``, which is what makes the
+        phasing metric computable at all: a Hi-C pair's two mates only tell us
+        something about phasing if we can say which haplotype each landed on,
+        and hifiasm gives the two haplotypes overlapping contig names.
+
+        Returns:
+            Path to the combined FASTA, or None if there is no second
+            haplotype (i.e. nothing to phase).
+        """
+        extra = [Path(f) for f in (extra_fasta_files or []) if Path(f).exists()]
+        if not extra:
+            return None
+
+        out = self.trial_dir / "diploid_prefixed.fasta"
+        with open(out, "w") as fh:
+            for index, source in enumerate([Path(fasta_file)] + extra, start=1):
+                subprocess.run(
+                    [
+                        "awk",
+                        "-v", f"p=h{index}_",
+                        '/^>/ {print ">" p substr($0, 2); next} {print}',
+                        str(source),
+                    ],
+                    stdout=fh,
+                    check=True,
+                )
+        return out
+
+    def subset_hic_reads(self, force=False):
+        """
+        Draw a fixed subset of Hi-C pairs, once, and reuse it every trial.
+
+        Both mates are sampled with the same seed so the pairing survives.
+
+        Returns:
+            ``(r1, r2)`` paths, or ``(None, None)`` when no Hi-C reads were
+            given.
+        """
+        if not (self.hic1 and self.hic2):
+            return None, None
+
+        outputs = []
+        for index, source in enumerate((self.hic1, self.hic2), start=1):
+            target = self.paths.reads_dir / f"hic_subset_{index}.fq"
+            outputs.append(target)
+            if target.exists() and not force:
+                continue
+            self.paths.reads_dir.mkdir(parents=True, exist_ok=True)
+            command = (
+                f"set -o pipefail; seqtk sample -s{self.subset_seed} "
+                f"{source} {self.num_hic_reads} > {target}"
             )
-            return {}
-
-        total = raw.get("sequences", 0.0)
-        mapped = raw.get("reads mapped", 0.0)
-        unmapped = raw.get("reads unmapped", 0.0)
-        supplementary = raw.get("supplementary alignments", 0.0)
-        # samtools reports the error rate as a fraction of aligned bases; per
-        # kb keeps it on a scale where a sensible weight is O(1) rather than
-        # O(1000).
-        error_rate_per_kb = raw.get("error rate", 0.0) * 1000.0
-
-        metrics = {
-            # --- scored ---------------------------------------------------
-            "reads_mapped": np.log(mapped + 1),
-            "supplementary_alignments": np.log(supplementary + 1),
-            "error_rate": error_rate_per_kb,
-            # --- reported only --------------------------------------------
-            "reads_total": np.log(total + 1),
-            "reads_unmapped": np.log(unmapped + 1),
-            "reads_mq0": np.log(raw.get("reads MQ0", 0.0) + 1),
-            "bases_mapped": np.log(raw.get("bases mapped (cigar)", 0.0) + 1),
-            "mismatches": np.log(raw.get("mismatches", 0.0) + 1),
-            "mapped_rate": (mapped / total * 100.0) if total > 0 else 0.0,
-            "average_read_length": raw.get("average length", 0.0),
-            "average_quality": raw.get("average quality", 0.0),
-        }
-
-        if total > 0 and (mapped / total) < 0.8:
-            self.logger.warning(
-                f"Only {mapped / total * 100:.1f}% of the subset reads mapped back "
-                "to this assembly. That usually means the assembly is badly "
-                "fragmented or a large fraction of the genome is missing."
-            )
-
-        return metrics
-
-    # --------------------------------------------------------------- sniffles
-    def run_sniffles2(self, bam_file, vcf_file=None):
-        """Call SVs from the sorted, indexed BAM built by :meth:`align_reads`."""
-        if vcf_file is None:
-            vcf_file = self.trial_dir / "sniffles_output.vcf"
-
-        command = f"sniffles -i {bam_file} -v {vcf_file} --allow-overwrite"
-        try:
             self.run_command(
                 command,
-                "sniffles2",
-                timeout_seconds=self.stage_walltime_seconds("sniffles"),
+                command_name=f"seqtk_sample_hic{index}",
+                timeout_seconds=self.stage_walltime_seconds("hic_phasing"),
             )
-            return self.parse_sniffles_vcf(vcf_file)
-        except (RuntimeError, TimeoutError):
-            self.logger.error("sniffles2 analysis failed")
-            raise
+        return outputs[0], outputs[1]
 
-    def parse_sniffles_vcf(self, vcf_file):
-        metrics = {"num_sv": 0}
-        try:
-            if not os.path.exists(vcf_file):
-                self.logger.warning(f"Sniffles VCF file not found: {vcf_file}")
-                return metrics
+    #: Count Hi-C pairs whose mates sit on different contigs, split by whether
+    #: those contigs belong to the same haplotype. Only read 1 of each pair is
+    #: counted (``-f 0x40``) so a pair contributes once, and 0x90c drops
+    #: unmapped, mate-unmapped, secondary and supplementary records.
+    _HIC_PAIR_AWK = (
+        '{ if ($7 != "=" && $7 != "*") { '
+        'a = substr($3, 1, 2); b = substr($7, 1, 2); '
+        'if (a == b) cis++; else trans++ } } '
+        'END { printf "%d %d\\n", cis + 0, trans + 0 }'
+    )
 
-            with open(vcf_file, "r") as f:
-                sv_count = sum(
-                    1 for line in f if line.strip() and not line.startswith("#")
-                )
+    #: The counts line: two integers alone on a line. ``run_command`` returns
+    #: the whole log file, which the subprocess logger prefixes with a banner
+    #: and a header, so the numbers have to be found rather than assumed to be
+    #: the first thing in the output.
+    _HIC_COUNTS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s*$", re.MULTILINE)
 
-            metrics["num_sv"] = np.log(sv_count + 1)
-            self.logger.debug(f"Detected {sv_count} structural variants")
-        except Exception as e:
-            self.logger.warning(f"Failed to parse sniffles VCF {vcf_file}: {e}")
-            metrics["num_sv"] = 0
+    @classmethod
+    def parse_hic_pair_counts(cls, output):
+        """
+        Turn the ``cis trans`` line from :attr:`_HIC_PAIR_AWK` into metrics.
+
+        ``trans_hap_rate`` is the percentage of informative pairs whose two
+        mates landed on *different* haplotypes. Hi-C contacts happen within a
+        physical chromosome, so in a correctly phased assembly this should be
+        small; a high value means contigs have been assigned to the wrong
+        haplotype. It is the only metric here that responds directly to
+        --s-base, --f-perturb and --l-msjoin.
+
+        ``hic_pairs_informative`` is unweighted and exists so a suspiciously
+        good rate computed from a handful of pairs is visible rather than
+        silently trusted.
+
+        The last match wins: the log is opened in append mode, so a retry
+        within one trial leaves the earlier attempt's counts above the current
+        ones.
+        """
+        matches = cls._HIC_COUNTS_RE.findall(output or "")
+        if not matches:
+            raise RuntimeError(
+                "Could not find the Hi-C pair counts in the command output. "
+                "Check the hic_phasing log for a minimap2 or samtools error."
+            )
+        cis, trans = (int(v) for v in matches[-1])
+        informative = cis + trans
+        if informative == 0:
+            raise RuntimeError(
+                "No informative Hi-C pairs: every pair was unmapped, "
+                "low-quality, or had both mates on one contig. Raise "
+                "--num-hic-reads or lower --hic-min-mapq."
+            )
+        return {
+            "trans_hap_rate": 100.0 * trans / informative,
+            "hic_pairs_informative": float(np.log(informative + 1)),
+        }
+
+    def run_hic_phasing(self, diploid_fasta):
+        """
+        Measure how consistently Hi-C links stay inside one haplotype.
+
+            minimap2 -ax sr diploid.fa hic_1.fq hic_2.fq
+              | samtools view -q <mapq> -F 0x90c -f 0x40 -
+              | awk '<count cis vs trans>'
+
+        The MAPQ filter is doing the real work. Two haplotypes of one
+        individual are nearly identical, so most Hi-C reads map equally well
+        to both and get MAPQ 0. What survives the filter is the subset of
+        reads that overlap a haplotype-distinguishing variant -- which is
+        exactly the subset that carries phasing information, and the same
+        signal hifiasm partitions on. It does mean the metric is computed
+        from a minority of the sampled pairs, which is why the surviving
+        count is reported alongside the rate.
+
+        Circularity is worth naming: hifiasm phased using these same reads, so
+        this is a fit statistic rather than an independent test. It still
+        separates parameter sets that phase from ones that do not. Holding
+        out a fraction of the pairs from the hifiasm invocation would make it
+        a genuine cross-validation; that is not done here because it would
+        change what the final assembly is built from.
+        """
+        if diploid_fasta is None:
+            raise RuntimeError(
+                "Hi-C phasing needs two haplotype assemblies; only one was "
+                "produced. This stage is only meaningful for --hic1/--hic2 runs."
+            )
+
+        r1, r2 = self.subset_hic_reads()
+        if not (r1 and r2):
+            raise RuntimeError("Hi-C read subset unavailable")
+
+        command = (
+            f"set -o pipefail; "
+            f"minimap2 -ax sr -t {self.threads} {diploid_fasta} {r1} {r2} "
+            f"| samtools view -q {self.hic_min_mapq} -F 0x90c -f 0x40 - "
+            f"| awk '{self._HIC_PAIR_AWK}'"
+        )
+
+        self.logger.info("Scoring Hi-C phasing consistency (minimap2 -x sr)")
+        output = self.run_command(
+            command,
+            command_name="hic_phasing",
+            timeout_seconds=self.stage_walltime_seconds("hic_phasing"),
+        )
+        metrics = self.parse_hic_pair_counts(output)
+        self.logger.info(
+            "Hi-C phasing: %.2f%% of %d informative pairs link across "
+            "haplotypes",
+            metrics["trans_hap_rate"],
+            round(float(np.expm1(metrics["hic_pairs_informative"]))),
+        )
         return metrics
 
     # ---------------------------------------------------------------- scoring
     def _load_weights(self):
         """Load metric weights from weights.json, falling back to defaults."""
+        # Importances, not signed weights. Direction is already handled: every
+        # metric is scored as a log2 fold change signed so that positive means
+        # better, so a weight here answers one question -- what is a doubling
+        # (or halving) of this quantity worth, relative to the others?
         default_weights = {
-            "num_contigs": -0.8,
-            "length_diff": -1,
-            "n50": 1,
-            "single_copy": 1,
-            "multi_copy": -0.7,
-            "fragmented": -0.7,
-            "missing": -1,
-            "num_sv": -0.5,
-            # samtools stats. reads_mapped and supplementary_alignments are
-            # log-scale counts, so they sit naturally alongside n50.
-            "reads_mapped": 0.8,
-            "supplementary_alignments": -0.7,
-            # error_rate is raw, in mismatches per kb of aligned sequence
-            # (typically 1-5 for HiFi, higher for ONT).
-            "error_rate": -0.6,
-            # Raw (non-log) metrics. QV is Phred (~40-60) and completeness is
-            # a percentage (~95-100), so the weights are deliberately small to
-            # keep their contributions on the same order as log-scale n50.
-            "qv": 0.1,
-            "kmer_completeness": 0.1,
+            # Contiguity. Halving the contig count and doubling the N50 are
+            # the two headline improvements, priced equally.
+            "num_contigs": 1.0,
+            "length_diff": 0.5,
+            "n50": 1.0,
+            # Per-haplotype versions, used instead of the three above when a
+            # second haplotype exists. Each carries half the single-haplotype
+            # weight so that splitting a metric in two does not silently
+            # double how much that property counts for.
+            "num_contigs_hap1": 0.5,
+            "num_contigs_hap2": 0.5,
+            "length_diff_hap1": 0.25,
+            "length_diff_hap2": 0.25,
+            "n50_hap1": 0.5,
+            "n50_hap2": 0.5,
+            # Gene space. The three deficits carry the signal, because they can
+            # halve or double; single_copy is a bounded count that barely moves
+            # proportionally (605 -> 610 out of 672 is 0.8%), so it is priced
+            # low rather than pretending otherwise.
+            "single_copy": 0.2,
+            "multi_copy": 0.7,
+            "fragmented": 0.7,
+            "missing": 1.0,
+            # k-mer metrics, both scored on what the assembly is *short of*
+            # rather than the percentage itself (see `badness`), so halving the
+            # missing k-mers or halving the error rate behind the QV each move
+            # one unit, like everything else here.
+            "qv": 1.0,
+            "kmer_completeness": 1.0,
+            "kmer_completeness_hap1": 0.5,
+            "kmer_completeness_hap2": 0.5,
+            # Hi-C phasing. Halving the cross-haplotype link rate is worth as
+            # much as halving the contig count: a well-phased assembly and a
+            # contiguous one are meant to trade off, not for one to dominate.
+            "trans_hap_rate": 1.0,
         }
 
         candidates = [
@@ -1415,18 +1936,36 @@ class AssemblyEvaluator:
                     loaded = json.load(fh) or {}
 
                 validated = {}
+                negative_keys = []
                 for key, default in default_weights.items():
                     if key not in loaded:
                         validated[key] = default
                         continue
                     try:
-                        validated[key] = float(loaded[key])
+                        raw_weight = float(loaded[key])
+                        # Weights used to carry direction as a sign. They no
+                        # longer need to -- the fold change is already signed
+                        # so positive means better -- so a negative weight here
+                        # would invert the metric. The magnitude is used and
+                        # the file is flagged once.
+                        if raw_weight < 0:
+                            negative_keys.append(key)
+                        validated[key] = abs(raw_weight)
                     except (TypeError, ValueError):
                         log.warning(
                             f"Invalid weight for '{key}' in {candidate}; "
                             f"using the default ({default})"
                         )
                         validated[key] = default
+
+                if negative_keys:
+                    log.warning(
+                        f"{candidate} gives a negative weight to "
+                        f"{', '.join(sorted(negative_keys))}. Weights are now "
+                        "importances: each metric's direction is handled by the "
+                        "fold change itself, so the magnitude has been used. "
+                        "Make them positive to silence this."
+                    )
 
                 # Silently ignoring these used to make a typo look like it had
                 # worked; the objective simply never changed.
@@ -1468,6 +2007,33 @@ class AssemblyEvaluator:
                 continue
             for metric in stage.metrics:
                 weights.pop(metric, None)
+
+        # A run produces either the unsuffixed split metrics or the
+        # per-haplotype ones, never both. Leaving the unproduced names in here
+        # would put metrics that can never appear into metric_regime and into
+        # the single-objective metric list.
+        split = list(self.HAPLOTYPE_SPLIT_METRICS)
+        if self.n_haplotypes < 2:
+            drop = [f"{m}_hap{i}" for m in split + ["kmer_completeness"]
+                    for i in (1, 2)]
+        else:
+            drop = split
+        for metric in drop:
+            weights.pop(metric, None)
+
+        # A metric the baseline never measured has nothing to be a fold change
+        # against, so it cannot be scored. Dropping it here rather than at
+        # scoring time keeps metric_regime honest about what the study is
+        # actually optimising.
+        if self.baseline_metrics:
+            for metric in [m for m in weights if m not in self.baseline_metrics]:
+                weights.pop(metric, None)
+
+        # Likewise a metric that never moved during the burn-in has no scale to
+        # be divided by, and scoring it would only add noise.
+        if self.metric_scales:
+            for metric in [m for m in weights if m not in self.metric_scales]:
+                weights.pop(metric, None)
         return weights
 
     def weights_for(self, metrics):
@@ -1500,65 +2066,220 @@ class AssemblyEvaluator:
         keys = self.active_weights() if metrics is None else self.weights_for(metrics)
         return ",".join(sorted(keys))
 
+    # -------------------------------------------------------- fold changes
+    #: Metrics where a larger raw value is better. Everything else is treated
+    #: as "smaller is better", so these are inverted before the ratio.
+    HIGHER_IS_BETTER = frozenset(
+        {"n50", "n50_hap1", "n50_hap2", "single_copy", "hic_pairs_informative"}
+    )
+
+    @classmethod
+    def badness(cls, name, raw):
+        """
+        Turn a raw measurement into a quantity where *smaller is better*.
+
+        Every metric is then compared by the same ratio against the baseline,
+        so nothing downstream needs to know which way a metric runs. Three
+        families need more than a pseudocount:
+
+        ``qv``
+            Phred is already the logarithm of an error rate, so a ratio of QVs
+            is a ratio of logarithms: 50 -> 45 reads as a 9% change when it is
+            really 3.2x more errors. Converting back to the error rate makes a
+            3.01 dB gain exactly one halving.
+        ``kmer_completeness``
+            Bounded at 100%, so the ratio of the percentages barely moves --
+            99.0 -> 99.5 is a factor of 1.005. What actually halved is the
+            *deficit*, and that is the quantity worth scoring.
+        ``trans_hap_rate``
+            Also a percentage, and legitimately zero on a perfectly phased
+            assembly, so it takes the same floor as the deficit above.
+        """
+        if name.startswith("qv"):
+            return 10.0 ** (-raw / 10.0)
+        if name.startswith("kmer_completeness"):
+            return max(100.0 - raw, FC_DEFICIT_FLOOR)
+        if name == "trans_hap_rate":
+            return max(raw, FC_DEFICIT_FLOOR)
+        if name in cls.HIGHER_IS_BETTER:
+            # 1/x turns "more is better" into "less is better" without needing
+            # a sign anywhere downstream.
+            return 1.0 / (raw + FC_PSEUDOCOUNT)
+        return raw + FC_PSEUDOCOUNT
+
+    @staticmethod
+    def compute_metric_scales(observations, keys):
+        """
+        The typical size of each metric's fold change during the burn-in.
+
+        ``observations`` is one ``{metric: log2FC}`` dict per burn-in trial,
+        **excluding the baseline** -- its fold change against itself is zero by
+        construction and would only deflate the scale.
+
+        The statistic is the root mean square about *zero*, not the standard
+        deviation about the burn-in mean, because the scores it will divide are
+        themselves measured from the baseline rather than from the mean. If
+        every random parameter set lands 4x worse than default but tightly
+        clustered, the standard deviation is near zero and an entirely typical
+        trial scores -28; the RMS is 2.0 and the same trial scores -1.0, which
+        is the honest reading.
+
+        A metric that never moved gets no scale, which drops it from the score
+        for the rest of the study: it cannot separate one trial from another.
+        """
+        scales = {}
+        for key in keys:
+            values = [
+                float(o[key])
+                for o in observations
+                if key in o and o[key] is not None and np.isfinite(o[key])
+            ]
+            if len(values) < SCALE_MIN_OBSERVATIONS:
+                continue
+            rms = float(np.sqrt(np.mean(np.square(values))))
+            if not np.isfinite(rms) or rms <= SCALE_MIN:
+                continue
+            scales[key] = {"scale": rms, "n": len(values)}
+        return scales
+
+    def save_metric_scales(self, scales):
+        """Persist the burn-in scales and adopt them for this evaluator."""
+        self.metric_scales = dict(scales)
+        self._write_json(self.paths.metric_scales, self.metric_scales, "metric scales")
+
+    def standardised(self, name, stored_value):
+        """
+        The metric's fold change divided by how much it typically moves.
+
+        Returns None during the burn-in, when there is no scale yet, so callers
+        can fall back to the raw fold change.
+        """
+        fc = self.fold_change(name, stored_value)
+        if fc is None:
+            return None
+        entry = self.metric_scales.get(name)
+        if not entry:
+            return None
+        scale = float(entry.get("scale", 0.0))
+        if not np.isfinite(scale) or scale <= SCALE_MIN:
+            return None
+        return float(np.clip(fc / scale, -Z_CLIP, Z_CLIP))
+
+    @property
+    def is_standardised(self) -> bool:
+        """True once the burn-in has produced usable scales."""
+        return bool(self.metric_scales)
+
+    def save_baseline_metrics(self, metrics):
+        """Record the default-parameter assembly and adopt it as the reference."""
+        self.baseline_metrics = {
+            k: float(v)
+            for k, v in metrics.items()
+            if np.isfinite(float(v))
+        }
+        self._write_json(
+            self.paths.baseline_metrics, self.baseline_metrics, "baseline metrics"
+        )
+
+    def fold_change(self, name, stored_value):
+        """
+        log2 fold change of one metric against the baseline, signed so that
+        **positive always means better**.
+
+        log2 rather than a plain ratio because a plain ratio is asymmetric: a
+        doubling moves 1.0 away from "no change" while a halving moves only
+        0.5, so summing plain ratios quietly rewards metrics that worsened more
+        than it rewards ones that improved. Under log2 a doubling is +1 and a
+        halving is -1, whichever direction the metric runs.
+
+        Computed on *raw* values, never the stored log(v+1) ones: a ratio of
+        logarithms is not a fold change. num_contigs going 1 -> 1000 is a ratio
+        of 9.97 in stored units and a 500x collapse in reality.
+
+        Returns None when the baseline never measured this metric, which is the
+        signal that it cannot be scored (see :meth:`active_weights`).
+        """
+        base = self.baseline_metrics.get(name)
+        if base is None:
+            return None
+        try:
+            b_trial = self.badness(name, self.raw_value(name, stored_value))
+            b_base = self.badness(name, self.raw_value(name, base))
+        except (TypeError, ValueError):
+            return None
+        if not (np.isfinite(b_trial) and np.isfinite(b_base)):
+            return 0.0
+        if b_trial <= 0 or b_base <= 0:
+            return 0.0
+        # badness is "smaller is better", so baseline/trial above 1 means this
+        # trial improved on the baseline.
+        lfc = float(np.log2(b_base / b_trial))
+        if not np.isfinite(lfc):
+            return 0.0
+        return float(np.clip(lfc, -FC_CLIP, FC_CLIP))
+
+    def scored_value(self, name, value):
+        """
+        What the weight multiplies.
+
+        Before the burn-in has produced scales, the raw log2 fold change. After
+        it, that fold change divided by how far the metric typically moves, so
+        that a weight buys the same thing on a volatile metric as on a steady
+        one.
+        """
+        fc = self.fold_change(name, value)
+        if fc is None:
+            return 0.0
+        if not self.metric_scales:
+            return fc
+        z = self.standardised(name, value)
+        return 0.0 if z is None else z
+
+    @property
+    def has_baseline(self) -> bool:
+        """True once the default-parameter assembly has been measured."""
+        return bool(self.baseline_metrics)
+
+    # ---------------------------------------------------------------- scoring
     def calculate_weighted_sum(self, metrics):
+        """
+        Sum of ``importance x log2 fold change`` over every scored metric.
+
+        The baseline assembly scores exactly 0 by construction, so the sign of
+        a trial's score says directly whether it beat plain hifiasm.
+        """
         return sum(
-            weight * float(metrics[name])
+            weight * self.scored_value(name, metrics[name])
             for name, weight in self.weights_for(metrics).items()
         )
 
     def analyze_metric_contributions(self, metrics):
         """
-        Break the weighted score down per metric.
+        Per-metric breakdown of the score.
 
-        ``log_value`` is what the optimiser actually multiplies by the weight;
-        ``raw_value`` is the same number back-transformed out of log space and
-        exists purely so the log lines are readable (a contig N50 of 34 Mb is
-        useful information, ``17.34`` is not).
+        ``raw_value`` is the measurement back-transformed out of log space so
+        the log is readable (a contig N50 of 34 Mb is useful information,
+        ``17.34`` is not); ``fc`` is its log2 fold change against the baseline,
+        positive when the trial is better, and None for a metric the baseline
+        never measured.
         """
-        contributions = {}
-        weighted_sum = 0.0
+        rows = {}
+        total = 0.0
 
-        for metric_name, weight in self.weights_for(metrics).items():
-            value = float(metrics[metric_name])
-            contribution = weight * value
-            weighted_sum += contribution
-            contributions[metric_name] = {
+        for name, weight in self.weights_for(metrics).items():
+            value = float(metrics[name])
+            fc = self.fold_change(name, value)
+            total += weight * self.scored_value(name, value)
+            rows[name] = {
                 "log_value": value,
-                "raw_value": self.raw_value(metric_name, value),
-                "unit": self.METRIC_UNITS.get(metric_name, ""),
+                "raw_value": self.raw_value(name, value),
+                "unit": self.METRIC_UNITS.get(name, ""),
                 "weight": weight,
-                "contribution": contribution,
+                "fc": fc,
+                "z": self.standardised(name, value),
             }
 
-        positive_contributions = sum(
-            c["contribution"] for c in contributions.values() if c["contribution"] > 0
-        )
-        negative_contributions = abs(
-            sum(
-                c["contribution"]
-                for c in contributions.values()
-                if c["contribution"] < 0
-            )
-        )
-
-        for data in contributions.values():
-            if positive_contributions > 0 and data["contribution"] > 0:
-                data["proportion"] = (
-                    data["contribution"] / positive_contributions
-                ) * 100
-            elif negative_contributions > 0 and data["contribution"] < 0:
-                data["proportion"] = (
-                    abs(data["contribution"]) / negative_contributions
-                ) * 100
-            else:
-                data["proportion"] = 0.0
-
-        return {
-            "total_score": weighted_sum,
-            "positive_sum": positive_contributions,
-            "negative_sum": negative_contributions,
-            "contributions": contributions,
-        }
+        return {"total_score": total, "contributions": rows}
 
     # ------------------------------------------------------------- evaluation
     def evaluate_assembly(
@@ -1568,6 +2289,8 @@ class AssemblyEvaluator:
         include_busco=None,
         busco_lineage="metazoa_odb12",
         extra_fasta_files=None,
+        extra_gfa_files=None,
+        gate=None,
     ):
         """
         Run the evaluation pipeline for one assembly.
@@ -1595,9 +2318,17 @@ class AssemblyEvaluator:
             fasta_file: Where to write the FASTA derived from ``gfa_file``.
             include_busco: Run BUSCO. Defaults to the constructor setting.
             busco_lineage: BUSCO lineage dataset name.
-            extra_fasta_files: Additional haplotype FASTAs, used only to make
-                the k-mer completeness estimate reflect the whole diploid
-                assembly rather than one haplotype.
+            extra_fasta_files: Additional haplotype FASTAs. When present the
+                assembly is scored as a diploid: reads are aligned to both
+                haplotypes, QV is averaged over them, and k-mer completeness
+                is measured on their union.
+            extra_gfa_files: The matching haplotype GFAs, so gfastats measures
+                every haplotype rather than only the first.
+            gate: Optional callable invoked with the gfastats metrics as soon
+                as they exist, before anything expensive runs. Whatever it
+                raises propagates untouched, which is how the caller aborts a
+                trial whose contiguity has already collapsed without paying
+                for alignment, yak and completeness first.
 
         Returns:
             dict of metrics (see the class docstring for the log convention).
@@ -1617,29 +2348,50 @@ class AssemblyEvaluator:
         metrics = {}
 
         def absorb(ok, value):
-            if ok and value:
-                metrics.update(value)
+            if not (ok and value):
+                return
+            # A non-finite measurement cannot be summed, averaged or
+            # standardised, so it is dropped here rather than allowed to reach
+            # the score. yak reports a QV of `inf` when it finds no k-mer
+            # errors at all, which is a real result but not a usable number:
+            # it made the burn-in mean `inf` and the spread `nan`, and every
+            # trial afterwards scored `nan`.
+            for name, v in value.items():
+                try:
+                    finite = np.isfinite(float(v))
+                except (TypeError, ValueError):
+                    finite = False
+                if finite:
+                    metrics[name] = v
+                else:
+                    self.logger.warning(
+                        f"Metric '{name}' came back as {v!r}, which cannot be "
+                        "scored; it is dropped for this assembly."
+                    )
 
-        absorb(*self._run_stage("gfastats", lambda: self.run_gfastats(gfa_file)))
-
-        # One alignment, two consumers: samtools stats and sniffles2.
-        aligned, bam = self._run_stage(
-            "alignment", lambda: self.align_reads(fasta_file)
+        absorb(
+            *self._run_stage(
+                "gfastats",
+                lambda: self.run_gfastats(gfa_file, extra_gfa_files=extra_gfa_files),
+            )
         )
 
-        if aligned:
-            absorb(
-                *self._run_stage(
-                    "samtools_stats", lambda: self.run_samtools_stats(bam)
-                )
+        # Cheapest stage first, then the decision to keep going. gfastats costs
+        # seconds; everything below it costs hours.
+        if gate is not None and metrics:
+            gate(metrics)
+
+        # The combined haplotype FASTA exists for the phasing metric only: it
+        # is the one measurement that needs to know which haplotype a contig
+        # belongs to.
+        try:
+            diploid_fasta = self.build_diploid_fasta(fasta_file, extra_fasta_files)
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(
+                f"Could not build the combined haplotype FASTA ({e}); "
+                "the Hi-C phasing metric will be unavailable for this trial."
             )
-            absorb(
-                *self._run_stage("sniffles", lambda: self.run_sniffles2(bam))
-            )
-        else:
-            # Mark the dependants so _run_stage reports the real reason.
-            for dependent in ("samtools_stats", "sniffles"):
-                self._run_stage(dependent, lambda: None)
+            diploid_fasta = None
 
         absorb(
             *self._run_stage(
@@ -1649,10 +2401,28 @@ class AssemblyEvaluator:
                 ),
             )
         )
+        # Completeness runs last and is the memory spike that ends runs. Every
+        # stage above it has finished with its buffers by now, so give those
+        # pages back to the kernel before the spike rather than holding them
+        # against it.
+        self._release_memory("the alignment and k-mer stages")
+
+        # Completeness stays on hap1 deliberately. Each haplotype should carry
+        # the full gene set once, so the question "is the gene space complete
+        # and single-copy" is already answered by one haplotype -- and running
+        # the most expensive stage twice to average two nearly identical
+        # numbers is not worth doubling the cost of every trial. Collapsed
+        # phasing still shows up here, as multi_copy on hap1.
         absorb(
             *self._run_stage(
                 "busco",
-                lambda: self.run_busco(fasta_file, lineage=busco_lineage),
+                lambda: self.run_completeness(fasta_file, lineage=busco_lineage),
+            )
+        )
+
+        absorb(
+            *self._run_stage(
+                "hic_phasing", lambda: self.run_hic_phasing(diploid_fasta)
             )
         )
 

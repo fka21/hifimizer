@@ -17,7 +17,8 @@ be deleted without losing a result.
         ├── hifiasm/               shared hifiasm prefix -> .bin files are reused
         ├── reads/                 subset_reads.fa
         ├── kmers/                 reads.yak
-        ├── busco_downloads/       lineage datasets
+        ├── busco_downloads/       BUSCO lineage datasets (fallback path)
+        ├── compleasm_downloads/   compleasm lineage library (primary path)
         ├── cache/                 busco_backend_cache.json,
         │                          metric_stage_state.json
         └── trials/trial_<id>/     sam, bam, vcf, busco output, yak qv txt
@@ -52,6 +53,10 @@ class RunPaths:
         self.reads_dir = self.work_dir / "reads"
         self.kmers_dir = self.work_dir / "kmers"
         self.busco_downloads_dir = self.work_dir / "busco_downloads"
+        # compleasm keeps miniprot-indexed lineages in its own format; a BUSCO
+        # lineage directory is not a drop-in substitute, so the two never share
+        # a directory.
+        self.compleasm_downloads_dir = self.work_dir / "compleasm_downloads"
         self.cache_dir = self.work_dir / "cache"
         self.trials_dir = self.work_dir / "trials"
 
@@ -91,6 +96,45 @@ class RunPaths:
         return self.cache_dir / "metric_stage_state.json"
 
     @property
+    def baseline_metrics(self) -> Path:
+        """
+        The default-parameter assembly's metrics, which every trial is scored
+        against as a fold change.
+
+        Lives beside ``metric_stage_state.json`` under ``work/cache`` for the
+        same reason: ``--force-rerun`` wipes ``work/``, and a fresh run must
+        measure its own baseline rather than score against the previous one's.
+        """
+        return self.cache_dir / "baseline_metrics.json"
+
+    @property
+    def metric_scales(self) -> Path:
+        """
+        Per-metric fold-change scale measured during the burn-in.
+
+        Lives beside ``baseline_metrics.json`` for the same reason: the two are
+        only meaningful together, and ``--force-rerun`` wipes ``work/`` so a
+        fresh run measures both again.
+        """
+        return self.cache_dir / "metric_scales.json"
+
+    @property
+    def hifiasm_fingerprint(self) -> Path:
+        """
+        Records which flags produced the ``.bin`` files at ``hifiasm_prefix``.
+
+        hifiasm's own checkpoint loading (``load_index_from_disk``) resumes
+        from whatever it finds at ``-o`` opportunistically; it validates a
+        handful of specific fields (e.g. the error-correction round count) but
+        not whether ``--primary``/``--hic``/``--ul``/``--hifiasm-extra`` match
+        between the run that wrote the files and the run reading them. A
+        mismatch there can make hifiasm exit 0 while writing an output under a
+        different naming convention than the current flags predict. This file
+        is hifimizer's own check for that, since hifiasm does not do it.
+        """
+        return self.hifiasm_dir / ".fingerprint.json"
+
+    @property
     def hifiasm_prefix(self) -> Path:
         """Shared hifiasm ``-o`` prefix; keeps .bin reuse across trials."""
         return self.hifiasm_dir / "trial_assembly"
@@ -111,6 +155,7 @@ class RunPaths:
             self.reads_dir,
             self.kmers_dir,
             self.busco_downloads_dir,
+            self.compleasm_downloads_dir,
             self.cache_dir,
             self.trials_dir,
         ):
