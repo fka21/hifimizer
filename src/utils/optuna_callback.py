@@ -170,10 +170,16 @@ class RelativeImprovementDetector:
             # dividing by a negative previous value flipped the sign of the
             # improvement, so a run of worsening scores read as "improving"
             # and convergence was never detected.
-            if previous == 0:
-                relative_improvement = float("inf") if delta > 0 else 0.0
-            else:
-                relative_improvement = delta / abs(previous)
+            #
+            # The floor of 1.0 is what makes this survive Z-scoring. A Z-based
+            # score is centred on zero by construction, so `previous` sits near
+            # zero routinely rather than exceptionally, and an unfloored ratio
+            # turns a 0.001 wobble around 0.002 into a 50% "improvement" that
+            # resets the patience counter forever. Below a score of 1.0 the
+            # test degrades to an absolute one, which is the right reading when
+            # the units are already standard deviations.
+            denominator = max(abs(previous), 1.0)
+            relative_improvement = delta / denominator
 
             if relative_improvement < self.threshold:
                 self.poor_improvement_count += 1

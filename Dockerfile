@@ -21,28 +21,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2. Conda env
 # ----------------------------
 COPY environment.yml .
+RUN conda config --system --set auto_activate_base false
 RUN conda env create -f environment.yml && conda clean -afy
+
+# ----------------------------------------------------------------------------
+# 2b. compleasm, in a SEPARATE environment
+# ----------------------------------------------------------------------------
+COPY environment.compleasm.yml .
+RUN conda env create -f environment.compleasm.yml --solver=libmamba && conda clean -afy
+ENV COMPLEASM_BIN=/opt/conda/envs/compleasm/bin/compleasm
 
 # ----------------------------------------------------------------------------
 # 3. Make the environment's interpreter *the* interpreter for this image
 # ----------------------------------------------------------------------------
-# This is the fix for "numpy is not installed".
-#
-# The previous image relied solely on the entrypoint running `conda activate`.
-# That covers `docker run <image> <cmd>` and nothing else. It is bypassed by:
-#
-#   docker exec <container> python src/hifimizer.py ...
-#   docker run --entrypoint python <image> ...
-#   singularity/apptainer exec <image.sif> ...     (Docker ENTRYPOINT ignored)
-#   any HPC runner that invokes the image's command directly
-#
-# In all of those, PATH still starts with /opt/conda/bin, so `python` is the
-# *base* miniconda interpreter -- which has no numpy, no optuna, no Bio. The
-# symptom is exactly "ModuleNotFoundError: No module named 'numpy'".
-#
-# Baking the env's bin directory into ENV PATH removes that whole class of
-# failure. The entrypoint is kept as well, because activation additionally
-# sources the env's activate.d hooks (R, perl, GDK_PIXBUF, ...).
 ENV PATH="${CONDA_ENV_PATH}/bin:${PATH}"
 ENV CONDA_DEFAULT_ENV=optimizer
 
@@ -54,10 +45,6 @@ ENV MPLCONFIGDIR=/tmp/mplconfig \
 # ----------------------------
 # 4. Install yak (k-mer QV + completeness)
 # ----------------------------
-# environment.yml already pulls yak from bioconda so that a plain
-# `conda env create` works without Docker. The env's bin directory takes
-# precedence, so the source build is installed straight into it to make sure
-# the version we actually run is this one.
 RUN git clone --depth 1 https://github.com/lh3/yak.git && \
     cd yak && \
     make && \
@@ -68,15 +55,17 @@ RUN git clone --depth 1 https://github.com/lh3/yak.git && \
 # ----------------------------------------------------------------------------
 # 5. Fail the *build* if the environment is incomplete
 # ----------------------------------------------------------------------------
-# Without this, a solver that quietly dropped a package (or a `pip:` section
-# that did not run) is only discovered hours into a run on a cluster.
 RUN python -c "import sys, numpy, scipy, optuna, plotly, psutil, Bio; \
 print('interpreter:', sys.executable); \
 print('numpy      :', numpy.__version__); \
 print('optuna     :', optuna.__version__)" && \
-    for tool in hifiasm minimap2 samtools sniffles gfastats busco yak; do \
+    for tool in hifiasm minimap2 samtools gfastats busco yak seqtk; do \
         command -v "$tool" >/dev/null || { echo "MISSING TOOL: $tool" >&2; exit 1; }; \
     done && echo "all external tools present"
+
+RUN PATH="/opt/conda/envs/compleasm/bin:${PATH}" "${COMPLEASM_BIN}" --version && \
+    PATH="/opt/conda/envs/compleasm/bin:${PATH}" command -v miniprot >/dev/null || \
+    { echo "compleasm environment is incomplete" >&2; exit 1; }
 
 # ----------------------------
 # 6. Your code

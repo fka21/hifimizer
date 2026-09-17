@@ -1,13 +1,12 @@
 {
-  "num_contigs": -0.8,
-  "length_diff": -1,
-  "n50": 1,
-  "single_copy": 1,
-  "multi_copy": -0.7,
-  "fragmented": -0.7,
-  "missing": -1,
-  "reads_mapped": 0.8,
-  "error_rate": -0.6,
-  "num_sv": -0.8,
-  "supplementary_alignments": -0.7
+  "num_contigs": 1.0,
+  "length_diff": 0.5,
+  "n50": 1.0,
+  "single_copy": 0.2,
+  "multi_copy": 0.7,
+  "fragmented": 0.7,
+  "missing": 1.0,
+  "qv": 1.0,
+  "kmer_completeness": 1.0,
+  "trans_hap_rate": 1.0
 }

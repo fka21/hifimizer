@@ -70,7 +70,7 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--version", action="version", version="%(prog)s 1.1.1")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.0.0")
 
     # Required Inputs
     required = parser.add_argument_group("Required arguments")
@@ -105,6 +105,30 @@ def get_args():
         type=str,
         help="Custom BUSCO download path. If set, BUSCO datasets will not be (re)downloaded.",
     )
+    general.add_argument(
+        "--compleasm-download-path",
+        type=str,
+        help=(
+            "Custom compleasm lineage library (compleasm's -L). Kept separate "
+            "from --busco-download-path: compleasm stores lineages "
+            "miniprot-indexed and in its own layout, so a BUSCO download "
+            "directory is not interchangeable with it."
+        ),
+    )
+    general.add_argument(
+        "--compleasm-bin",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to the compleasm executable. compleasm and BUSCO cannot "
+            "share a conda environment, so the container installs compleasm "
+            "into its own and advertises it through $COMPLEASM_BIN. Set this "
+            "only if you installed it somewhere else. When neither is set, "
+            "hifimizer looks on PATH and then for a conda environment named "
+            "'compleasm' next to its own."
+        ),
+    )
 
     general.add_argument(
         "--hom-cov",
@@ -129,33 +153,61 @@ def get_args():
         type=int,
         default=100,
         help=(
-            "Maximum number of trials. The first --convergence-warmup trials "
-            "always run; after that a multi-criteria convergence detector may "
-            "stop the study early."
+            "Maximum number of optimisation trials, on top of the burn-in. "
+            "The first --convergence-warmup always run; after that a "
+            "multi-criteria convergence detector may stop the study early."
         ),
     )
     optimization.add_argument(
-        "--num-reads",
+        "--burn-in-trials",
         type=int,
-        default=100000,
+        default=10,
+        metavar="N",
         help=(
-            "Fixed number of reads to subset for the alignment-based metrics "
-            "(samtools stats, sniffles2). This is a read *count*, not a coverage "
-            "target; the depth it works out to is computed from the sampled bases "
-            "and logged at startup. Aim for at least ~10x."
+            "Random-parameter trials run before the optimisation, on top of "
+            "trial 0 (hifiasm with default parameters, the reference every "
+            "trial is compared against). They measure how far each metric "
+            "actually moves when the parameters change, and every score "
+            "afterwards is divided by that - so a metric that happens to swing "
+            "wildly cannot outvote a steady one purely by swinging. They are "
+            "never pruned, and are carried into the optimisation as its "
+            "starting observations rather than discarded. Below about 5 the "
+            "scale estimates are too noisy to divide by."
         ),
     )
     optimization.add_argument(
         "--no-busco",
         dest="include_busco",
         action="store_false",
-        help="Disable BUSCO metrics during evaluation. By default, BUSCO metrics are included.",
+        help=(
+            "Disable the gene-space completeness metrics (single_copy, "
+            "multi_copy, fragmented, missing) during evaluation. These are "
+            "produced by compleasm where available and by BUSCO otherwise; "
+            "this flag switches off the whole stage regardless of backend. "
+            "By default they are included."
+        ),
+    )
+    optimization.add_argument(
+        "--no-compleasm",
+        dest="use_compleasm",
+        action="store_false",
+        help=(
+            "Skip compleasm and score gene-space completeness with BUSCO "
+            "directly. compleasm is the default because it is a miniprot-based "
+            "reimplementation of BUSCO that is both faster and considerably "
+            "lighter on peak memory; use this to reproduce BUSCO numbers "
+            "exactly, or if compleasm misbehaves on your lineage."
+        ),
     )
     optimization.add_argument(
         "--busco-lineage",
         type=str,
         default="metazoa_odb12",
-        help="BUSCO lineage database name",
+        help=(
+            "Lineage dataset name, passed to whichever completeness backend "
+            "runs. compleasm and BUSCO accept the same lineage names but store "
+            "them in incompatible formats, so each downloads its own copy."
+        ),
     )
     optimization.add_argument(
         "--multi-objective",
@@ -279,34 +331,6 @@ def get_args():
         help="Walltime for gfastats (num_contigs, length_diff, n50).",
     )
     stages.add_argument(
-        "--align-walltime",
-        type=float,
-        default=6.0,
-        metavar="HOURS",
-        help=(
-            "Walltime for the minimap2 | samtools sort read alignment. This "
-            "stage produces no metrics itself, but samtools stats and sniffles2 "
-            "both consume its BAM, so losing it loses both."
-        ),
-    )
-    stages.add_argument(
-        "--samtools-stats-walltime",
-        type=float,
-        default=1.0,
-        metavar="HOURS",
-        help=(
-            "Walltime for samtools stats (reads_mapped, error_rate, "
-            "supplementary_alignments)."
-        ),
-    )
-    stages.add_argument(
-        "--sniffles-walltime",
-        type=float,
-        default=2.0,
-        metavar="HOURS",
-        help="Walltime for sniffles2 structural-variant calling (num_sv).",
-    )
-    stages.add_argument(
         "--yak-walltime",
         type=float,
         default=2.0,
@@ -322,10 +346,67 @@ def get_args():
         default=6.0,
         metavar="HOURS",
         help=(
-            "Walltime for a single BUSCO gene-prediction attempt. BUSCO is "
-            "tried with miniprot, then metaeuk, then augustus; each attempt "
-            "gets this budget and the whole process group is killed on expiry. "
-            "Only when all three are exhausted does the stage count as failed."
+            "Walltime for a single gene-space completeness attempt. The chain "
+            "is compleasm, then BUSCO with metaeuk, then BUSCO with augustus; "
+            "each attempt gets this budget and the whole process group is "
+            "killed on expiry. Only when all of them are exhausted does the "
+            "stage count as failed. BUSCO's own miniprot backend is not in the "
+            "chain because compleasm already is miniprot."
+        ),
+    )
+    stages.add_argument(
+        "--hic-phasing-walltime",
+        type=float,
+        default=4.0,
+        metavar="HOURS",
+        help=(
+            "Walltime for the Hi-C phasing metric (trans_hap_rate). Only runs "
+            "when --hic1/--hic2 are given."
+        ),
+    )
+    stages.add_argument(
+        "--prune-fc",
+        type=float,
+        default=1.0,
+        metavar="LOG2FC",
+        help=(
+            "Abandon a trial straight after gfastats if its contig count, N50 "
+            "or length difference is worse than the default-parameter assembly "
+            "by more than this many log2 units (1.0 = twice as bad). gfastats "
+            "costs seconds and everything after it costs hours, so a collapsed "
+            "assembly is recognised before any of that is paid for. Measured "
+            "against trial 0 rather than the best trial so far, which stops "
+            "the bar ratcheting tighter every time the study improves. Set to "
+            "0 to disable pruning."
+        ),
+    )
+    stages.add_argument(
+        "--prune-min-metrics",
+        type=int,
+        default=2,
+        metavar="N",
+        help=(
+            "How many of the gated contiguity metrics must be past --prune-fc "
+            "before a trial is pruned. Contig count, N50 and length difference "
+            "are strongly coupled, so one of them drifting out is ordinary "
+            "variation and only several going at once is a collapsed assembly. "
+            "Set to 1 for the old behaviour of pruning on any single metric, "
+            "or 0 to disable pruning."
+        ),
+    )
+    stages.add_argument(
+        "--max-consecutive-pruned",
+        type=int,
+        default=10,
+        metavar="N",
+        help=(
+            "Stop the study after this many trials are pruned back to back "
+            "without one completing. Each pruned trial still costs a full "
+            "hifiasm run, and an unbroken run of them means the sampler is not "
+            "finding usable parameter sets. The best trial so far is still "
+            "assembled and reported. Counted consecutively, not in total: "
+            "prunes scattered across a long study are expected. Set to 0 to "
+            "never give up."
         ),
     )
     stages.add_argument(
@@ -362,6 +443,58 @@ def get_args():
     optional_inputs.add_argument("--hic1", type=str, help="Hi-C R1 reads file")
     optional_inputs.add_argument("--hic2", type=str, help="Hi-C R2 reads file")
     optional_inputs.add_argument("--ul", type=str, help="Ultra-long ONT reads file")
+    optional_inputs.add_argument(
+        "--num-hic-reads",
+        type=int,
+        default=1_000_000,
+        metavar="N",
+        help=(
+            "Hi-C read pairs subsampled once and reused by every trial to "
+            "score phasing. Only the pairs that survive --hic-min-mapq are "
+            "informative, and that is a minority, so this needs to be "
+            "generous; the surviving count is logged per trial as "
+            "hic_pairs_informative."
+        ),
+    )
+    optional_inputs.add_argument(
+        "--hic-min-mapq",
+        type=int,
+        default=20,
+        metavar="Q",
+        help=(
+            "Minimum MAPQ for a Hi-C mate to count towards phasing. The two "
+            "haplotypes are nearly identical, so reads that do not overlap a "
+            "distinguishing variant map ambiguously and carry no phasing "
+            "information; this filter is what removes them."
+        ),
+    )
+    optional_inputs.add_argument(
+        "--hifiasm-extra",
+        type=str,
+        default=None,
+        metavar="ARGS",
+        help=(
+            "Extra hifiasm arguments, quoted, applied to every run including "
+            "the default-parameter baseline. Anything hifimizer normally "
+            "optimizes is pinned to your value and dropped from the search "
+            "space (e.g. '-s 0.5' fixes -s instead of sampling it); anything "
+            "else is passed to hifiasm verbatim (e.g. '--telo-m CCCTAA'). "
+            "Flags hifimizer sets itself (-o, -t, --hg-size, --h1, --h2, "
+            "--ul, --primary, --ont, --hom-cov) are rejected -- use their "
+            "dedicated options."
+        ),
+    )
+    optional_inputs.add_argument(
+        "--no-hic-phasing",
+        dest="hic_phasing",
+        action="store_false",
+        help=(
+            "Skip the Hi-C phasing metric even when --hic1/--hic2 are given. "
+            "Without it the Hi-C parameters (--s-base, --f-perturb, "
+            "--l-msjoin) are tuned against an objective that cannot see "
+            "phasing quality."
+        ),
+    )
     optional_inputs.add_argument(
         "--ont",
         action="store_true",
