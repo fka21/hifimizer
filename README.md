@@ -30,7 +30,7 @@ far each metric actually moves. Every subsequent trial is scored as a fold chang
 divided by that metric's measured movement. A multi-criteria convergence detector stops the study early once
 the score stops improving.
 
-See **[Scoring: fold change against the default assembly](../../wiki/Scoring-and-Internals#scoring)** on the
+See **[Scoring: fold change against the default assembly](../../wiki/Home#scoring)** on the
 wiki for the full mechanics, including why log2 fold change is used and how the burn-in scale is computed.
 
 > **Note**
@@ -48,7 +48,7 @@ wiki for the full mechanics, including why log2 fold change is used and how the 
 ## What gets evaluated
 
 Directions live in `src/optim_directions.json`; importances live in `weights.json`
-(see the wiki's [Tuning the objective](../../wiki/Scoring-and-Internals#tuning-the-objective) section).
+(see the wiki's [Tuning the objective](../../wiki/Home#tuning-the-objective) section).
 
 | Source | Metric | Meaning |
 | --- | --- | --- |
@@ -146,7 +146,7 @@ The genome size accepts a suffix — `3G`, `1.5Gb`, `300M`, `750k` — or a bare
 
 Hifimizer persists its study in `optuna_study.db`, so runs are resumable and specific results can be
 reproduced without re-optimizing (`--force-rerun`, `--rerun-best`, `--rerun-trial N`). See the wiki's
-[Reruns and resuming](../../wiki/Scoring-and-Internals#reruns-and-resuming) section for details on what is
+[Reruns and resuming](../../wiki/Home#reruns-and-resuming) section for details on what is
 required to resume a study.
 
 ---
@@ -158,7 +158,7 @@ under the output directory; all intermediates live under `work/` and can be dele
 cost of a full hifiasm recompute on the next run).
 
 The full directory layout, including the contents of `work/`, is documented on the
-[wiki](../../wiki/Scoring-and-Internals#output-directory-layout).
+[wiki](../../wiki/Home#output-directory-layout).
 
 If the best trial turns out to be trial 0, no final assembly is built: the default assembly already on disk
 *is* the result, and the log says so rather than spending another hifiasm run reproducing it.
