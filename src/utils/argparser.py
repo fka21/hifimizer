@@ -1,21 +1,24 @@
 # args_parser.py
 import argparse
 
+from utils.assembly_eval import BITS_CAP
+from utils.samplers import SAMPLER_CHOICES, SAMPLER_DESCRIPTIONS
+
 
 def parse_genome_size(value: str) -> int:
     """
-    Parse a genome size string into an integer number of megabases.
+    Parse a genome size string into a number of megabases.
 
     Accepted suffixes (case-insensitive):
         G / Gb / GBp  →  gigabases  (multiply by 1 000)
         M / Mb / MBp  →  megabases  (no conversion, this is the internal unit)
-        K / Kb / KBp  →  kilobases  (divide by 1 000, rounded to nearest Mb)
+        K / Kb / KBp  →  kilobases  (divide by 1 000)
 
     A bare number with no suffix is assumed to be megabases, preserving
     backwards-compatibility with the previous integer-only behaviour.
 
     Examples:
-        "3G" → 3000, "1.5G" → 1500, "300M" → 300, "300" → 300, "750k" → 1
+        "3G" → 3000, "1.5G" → 1500, "300M" → 300, "300" → 300, "750k" → 0.75
     """
     raw = value.strip()
     suffixes = {
@@ -40,8 +43,11 @@ def parse_genome_size(value: str) -> int:
             numeric_str = raw[: -len(suffix)]
             break
 
+    # Not rounded to whole megabases: the value is both hifiasm's --hg-size and
+    # the target length_diff is measured against, and rounding made 4.64m
+    # count as 5 Mb, 2.5m as 2 Mb and anything under 500 kb as zero.
     try:
-        result = round(float(numeric_str) * multiplier)
+        result = float(numeric_str) * multiplier
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"Invalid genome size '{value}'. "
@@ -70,7 +76,7 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--version", action="version", version="%(prog)s 2.0.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.0.1")
 
     # Required Inputs
     required = parser.add_argument_group("Required arguments")
@@ -81,7 +87,7 @@ def get_args():
         help=(
             "Haploid genome size. Accepts a plain integer (treated as Mb) or a value "
             "with a suffix: G/Gb for gigabases, M/Mb for megabases, K/Kb for kilobases "
-            "(e.g. 3G, 1.5Gb, 300M, 300, 750k). Internally converted to whole megabases."
+            "(e.g. 3G, 1.5Gb, 300M, 300, 750k). Used exactly, not rounded."
         ),
     )
     required.add_argument(
@@ -103,16 +109,25 @@ def get_args():
     general.add_argument(
         "--busco-download-path",
         type=str,
-        help="Custom BUSCO download path. If set, BUSCO datasets will not be (re)downloaded.",
+        help=(
+            "Existing BUSCO dataset location: the download root (the folder "
+            "holding lineages/), its lineages/ folder, or the lineage folder "
+            "itself. When the lineage is found there, BUSCO runs with "
+            "--offline and nothing is downloaded or updated."
+        ),
     )
     general.add_argument(
         "--compleasm-download-path",
         type=str,
         help=(
-            "Custom compleasm lineage library (compleasm's -L). Kept separate "
-            "from --busco-download-path: compleasm stores lineages "
-            "miniprot-indexed and in its own layout, so a BUSCO download "
-            "directory is not interchangeable with it."
+            "Existing compleasm lineage library (compleasm's -L), or the "
+            "lineage folder inside it. Used by every trial. compleasm decides "
+            "what is present from its <lineage>.done markers and always wants "
+            "eukaryota_<odb> as well, so a library without those is completed "
+            "once at startup rather than per trial. Kept separate from "
+            "--busco-download-path: compleasm stores lineages miniprot-indexed "
+            "and in its own layout, so a BUSCO download directory is not "
+            "interchangeable with it."
         ),
     )
     general.add_argument(
@@ -146,34 +161,55 @@ def get_args():
     optimization.add_argument(
         "--sensitive",
         action="store_true",
-        help="Optimize D, N, and max_kocc for possibly higher quality (longer runtime). Can be used in combination with --primary, --hic1, --hic2, and --ul to optimize Hi-C and ultra-long read parameters as well. Will also optimize x, y, s, n, m, and p parameters.",
+        help=(
+            "Also optimize -D, -N and --max-kocc, plus -k (21/31/51/61), "
+            "-w (21/31/51/61/71), --max-od-ec (0.04/0.06/0.08; with --ont "
+            "0.07/0.09/0.11) and --max-od-final (0.03/0.05/0.07) as discrete "
+            "choices that include hifiasm's defaults. These act on hifiasm's "
+            "k-mer filtering, overlap and error-correction stages, which "
+            "hifiasm skips whenever it finds cached .bin files -- so in this "
+            "mode the cache is deleted before every hifiasm run and each trial "
+            "recomputes error correction from the raw reads. Expect every "
+            "trial to take several times longer. Combines with --primary, "
+            "--hic1/--hic2 and --ul, and still optimizes x, y, s, n, m and p."
+        ),
     )
     optimization.add_argument(
         "--num-trials",
         type=int,
         default=100,
         help=(
-            "Maximum number of optimisation trials, on top of the burn-in. "
+            "Maximum number of optimisation trials, on top of trial 0 (the "
+            "default-parameter baseline). "
             "The first --convergence-warmup always run; after that a "
             "multi-criteria convergence detector may stop the study early."
         ),
     )
     optimization.add_argument(
+        "--bits-cap",
+        type=float,
+        default=BITS_CAP,
+        metavar="BITS",
+        help=(
+            "Soft cap on how many bits any single metric can add to or take "
+            "from the weighted score. Every metric is scored as a log2 fold "
+            "change against trial 0 (+1 bit = twice as good, -1 = twice as "
+            "bad), which is scale-free, so no burn-in is needed to put the "
+            "metrics on one footing; but it is not bounded, and a single "
+            "runaway metric (a 500x contig-count collapse is -9 bits) would "
+            "otherwise outvote all the others. Applied as "
+            "cap * tanh(bits / cap): nearly linear below half the cap, "
+            "saturating smoothly above it, and still order-preserving. "
+            "A cap of 4 bits is a 16x change. Set to 0 to disable."
+        ),
+    )
+    # Accepted and ignored, so command lines written for the burn-in version
+    # keep working. hifimizer warns once when it is given.
+    optimization.add_argument(
         "--burn-in-trials",
         type=int,
-        default=10,
-        metavar="N",
-        help=(
-            "Random-parameter trials run before the optimisation, on top of "
-            "trial 0 (hifiasm with default parameters, the reference every "
-            "trial is compared against). They measure how far each metric "
-            "actually moves when the parameters change, and every score "
-            "afterwards is divided by that - so a metric that happens to swing "
-            "wildly cannot outvote a steady one purely by swinging. They are "
-            "never pruned, and are carried into the optimisation as its "
-            "starting observations rather than discarded. Below about 5 the "
-            "scale estimates are too noisy to divide by."
-        ),
+        default=None,
+        help=argparse.SUPPRESS,
     )
     optimization.add_argument(
         "--no-busco",
@@ -215,6 +251,19 @@ def get_args():
         help="Use multi-objective optimization (Pareto front). Default is single-objective optimization with weighted score.",
     )
     optimization.add_argument(
+        "--sampler",
+        type=str.lower,
+        choices=SAMPLER_CHOICES,
+        default=SAMPLER_CHOICES[0],
+        help=(
+            "How new parameter sets are proposed: "
+            + "; ".join(f"'{k}' = {v}" for k, v in SAMPLER_DESCRIPTIONS.items())
+            + ". 'gp' is single-objective only. A study is tied to the sampler "
+            "it started with: resuming it with a different one stops with an "
+            "error, and switching needs --force-rerun."
+        ),
+    )
+    optimization.add_argument(
         "--default-hifiasm",
         action="store_true",
         help="Run hifiasm assembly without optimized parameters, i.e. use all default parameter settings. Note: default behaviour of hifimizer saves the default assembly results into a default_assembly folder in the output directory.",
@@ -228,6 +277,21 @@ def get_args():
         "--force-rerun",
         action="store_true",
         help="Force rerun of optimization and assembly even if convergence was previously reached.",
+    )
+    optimization.add_argument(
+        "--continue-stopped",
+        action="store_true",
+        help=(
+            "Resume a study that has already stopped -- because it converged, "
+            "or was halted by --max-consecutive-pruned or --max-metric-skips "
+            "-- and run up to --num-trials more trials in it. Without this, "
+            "resuming a stopped study runs no new trials, in either single- or "
+            "multi-objective mode: it only reports the best trial and builds "
+            "the final assembly. The stop is cleared, so the study can stop "
+            "again on its own criteria; a study halted by a trial budget will "
+            "usually need that budget raised as well, since the trials that "
+            "used it up are still counted."
+        ),
     )
     optimization.add_argument(
         "--dry-run",
@@ -365,20 +429,29 @@ def get_args():
         ),
     )
     stages.add_argument(
-        "--prune-fc",
+        "--prune-bits",
         type=float,
         default=1.0,
-        metavar="LOG2FC",
+        metavar="BITS",
         help=(
             "Abandon a trial straight after gfastats if its contig count, N50 "
             "or length difference is worse than the default-parameter assembly "
-            "by more than this many log2 units (1.0 = twice as bad). gfastats "
-            "costs seconds and everything after it costs hours, so a collapsed "
-            "assembly is recognised before any of that is paid for. Measured "
-            "against trial 0 rather than the best trial so far, which stops "
-            "the bar ratcheting tighter every time the study improves. Set to "
-            "0 to disable pruning."
+            "by more than this many bits -- the same unit the score uses, "
+            "before the --bits-cap (1.0 = twice as bad, 2.0 = four times). "
+            "gfastats costs seconds and everything after it costs hours, so a "
+            "collapsed assembly is recognised before any of that is paid for. "
+            "Measured against trial 0 rather than the best trial so far, which "
+            "stops the bar ratcheting tighter every time the study improves. "
+            "Set to 0 to disable pruning."
         ),
+    )
+    # The pre-bits name, kept so existing command lines keep working.
+    stages.add_argument(
+        "--prune-fc",
+        dest="prune_bits",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     stages.add_argument(
         "--prune-min-metrics",
@@ -386,7 +459,7 @@ def get_args():
         default=2,
         metavar="N",
         help=(
-            "How many of the gated contiguity metrics must be past --prune-fc "
+            "How many of the gated contiguity metrics must be past --prune-bits "
             "before a trial is pruned. Contig count, N50 and length difference "
             "are strongly coupled, so one of them drifting out is ordinary "
             "variation and only several going at once is a collapsed assembly. "
@@ -501,4 +574,13 @@ def get_args():
         help="Use this flag if as input you provide ONT R10 simplex reads.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    # Checked here rather than when the sampler is built, which happens after
+    # the read k-mer hash and the completeness lineage are prepared -- hours
+    # into a run, for an error that is known from the command line alone.
+    if args.sampler == "gp" and args.multi_objective:
+        parser.error(
+            "--sampler gp supports a single objective only; use --sampler tpe "
+            "with --multi-objective."
+        )
+    return args

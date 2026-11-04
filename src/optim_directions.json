@@ -16,8 +16,6 @@
   "n50_hap2": "maximize",
   "length_diff_hap1": "minimize",
   "length_diff_hap2": "minimize",
-  "kmer_completeness_hap1": "maximize",
-  "kmer_completeness_hap2": "maximize",
   "qv_hap1": "maximize",
   "qv_hap2": "maximize",
   "hap1_length_mb": "minimize",

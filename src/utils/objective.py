@@ -5,14 +5,31 @@ from pathlib import Path
 
 import optuna
 
-from utils.hifiasm_command import build_hifiasm_command, parse_hifiasm_extra, collect_hifiasm_outputs
+from utils.hifiasm_command import (
+    build_hifiasm_command,
+    parse_hifiasm_extra,
+    collect_hifiasm_outputs,
+    delete_hifiasm_bins,
+    dual_scaf_supported,
+)
 from utils.subprocess_logger import SubprocessLogger, TIMEOUT_EXIT_CODE
-from utils.assembly_eval import AssemblyEvaluator, MetricStageFailure
+from utils.assembly_eval import AssemblyEvaluator, MetricStageFailure, BITS_CAP
 from utils.paths import RunPaths
 
 
-#: Objectives used when ``--multi-objective`` is set.
-PARETO_OBJECTIVES = ("n50", "single_copy", "qv", "length_diff")
+#: Objectives used when ``--multi-objective`` is set. Gene space is represented
+#: by missing BUSCOs: single_copy is no longer scored (see RETIRED_WEIGHT_KEYS).
+PARETO_OBJECTIVES = ("n50", "missing", "qv", "length_diff")
+
+#: Discrete values sampled in --sensitive mode, each including hifiasm 0.25.0's
+#: default (k 51, w 51, max-od-final 0.03). Smaller k / w and a larger maximum
+#: overlap difference are more lenient. hifiasm rejects k >= 64.
+SENSITIVE_K_CHOICES = (21, 31, 51, 61)
+SENSITIVE_W_CHOICES = (21, 31, 51, 61, 71)
+SENSITIVE_MAX_OD_FINAL_CHOICES = (0.03, 0.05, 0.07)
+#: --max-od-ec defaults to 0.04, but --ont raises it to 0.07, so the lenient
+#: values are counted from whichever default the run starts from.
+SENSITIVE_MAX_OD_EC_CHOICES = {False: (0.04, 0.06, 0.08), True: (0.07, 0.09, 0.11)}
 
 #: Added to the Pareto front for Hi-C runs. Without it the front trades
 #: contiguity against completeness while the phasing parameters
@@ -60,35 +77,71 @@ def haplotype_suffixes(hic1, hic2, ul, primary=False):
     return "bp.p_ctg", []
 
 
-def log_metric_report_legend():
+def log_weight_groups(evaluator):
+    """
+    Show what share of the score each metric group carries in this run.
+
+    Weights are set per metric, but metrics inside a group move together, so
+    the group total is the vote that matters. Shown once per run because it
+    depends on the mode: Hi-C adds the phasing group, a retired stage removes
+    one, and per-haplotype runs split contiguity across hap1 and hap2.
+    """
+    rows = evaluator.weight_groups()
+    if not rows:
+        return
+    logging.info(
+        f"\nWhat the score is made of (weights from {evaluator.weights_source})"
+    )
+    logging.info(f"    {'group':<12}{'weight':>8}{'share':>8}  metrics")
+    for group, weight, share, members in rows:
+        detail = ", ".join(
+            f"{m} {evaluator.weights[m]:g}" for m in members
+        )
+        logging.info(f"    {group:<12}{weight:>8.2f}{share:>7.0%}  {detail}")
+    logging.info(
+        "  The share is the most of the score a group can move. Metrics inside "
+        "a group move together (contig count and N50 nearly always do), so to "
+        "shift the balance between properties, scale a whole group's weights "
+        "in weights.json rather than one metric.\n"
+    )
+
+
+def log_metric_report_legend(bits_cap=BITS_CAP):
     """Explain the per-trial metric table. Called once, before optimisation."""
     logging.info("\nHow to read the per-trial metric reports below")
     logging.info(f"  {'value':<8}the real measurement, in its natural units")
     logging.info(
-        f"  {'log2FC':<8}how that compares with the default-parameter assembly "
+        f"  {'bits':<8}how that compares with the default-parameter assembly "
         "(trial 0), as a"
     )
     logging.info(
         f"  {'':<8}log2 fold change signed so POSITIVE IS ALWAYS BETTER. +1.00 "
         "is twice as"
     )
-    logging.info(f"  {'':<8}good, -1.00 twice as bad, 0.00 no change.")
     logging.info(
-        f"  {'scaled':<8}that fold change divided by how far this metric "
-        "typically moved"
+        f"  {'':<8}good, -1.00 twice as bad, 0.00 no change -- the same for "
+        "every metric,"
+    )
+    logging.info(f"  {'':<8}so no metric needs rescaling before it is scored.")
+    if bits_cap and bits_cap > 0:
+        logging.info(
+            f"  {'capped':<8}those bits soft-capped at +/-{bits_cap:.1f} "
+            f"(cap x tanh(bits / cap)), so"
+        )
+        logging.info(
+            f"  {'':<8}one runaway metric cannot outvote all the others. This "
+            "is what the"
+        )
+        logging.info(f"  {'':<8}weight multiplies.")
+    else:
+        logging.info(f"  {'capped':<8}identical to bits: --bits-cap is 0.")
+    logging.info(
+        f"  {'':<8}Score = weighted MEAN of the capped bits, weighted by the "
+        "importances in"
     )
     logging.info(
-        f"  {'':<8}during the burn-in, so a volatile metric cannot outvote a "
-        "steady one"
-    )
-    logging.info(
-        f"  {'':<8}just by swinging more. This is what the weight multiplies; "
-        "a dash means"
-    )
-    logging.info(f"  {'':<8}the burn-in has not measured a scale yet.")
-    logging.info(
-        f"  {'':<8}Score = sum of importance x scaled; importances live in "
-        "weights.json."
+        f"  {'':<8}weights.json, so +0.10 is a tenth of a doubling on average "
+        "in every mode."
     )
     logging.info(
         f"  {'':<8}Trial 0 scores exactly 0, so a positive score beat plain "
@@ -124,9 +177,10 @@ class ObjectiveBuilder:
         num_hic_reads=1_000_000,
         hic_min_mapq=20,
         hic_phasing=True,
-        prune_fc=1.0,
+        prune_bits=1.0,
         prune_min_metrics=2,
         hifiasm_extra=None,
+        bits_cap=BITS_CAP,
     ):
         self.evaluator = evaluator
         self.input_reads = input_reads
@@ -151,8 +205,9 @@ class ObjectiveBuilder:
         self.num_hic_reads = num_hic_reads
         self.hic_min_mapq = hic_min_mapq
         self.hic_phasing = hic_phasing
-        self.prune_fc = prune_fc
+        self.prune_bits = prune_bits
         self.prune_min_metrics = prune_min_metrics
+        self.bits_cap = bits_cap
         # Anything the user pinned is fixed for every run and never sampled;
         # anything hifimizer does not recognise is passed straight through.
         self.pinned_params, self.hifiasm_passthrough = parse_hifiasm_extra(
@@ -209,7 +264,18 @@ class ObjectiveBuilder:
             paths=self.paths,
             threads=self.threads,
             trial_id=trial_id,
-            download_path=self.download_path,
+            # The completeness settings come from the setup evaluator, not from
+            # this builder's own arguments: that evaluator is the one built
+            # from the command line, and the one that has already resolved
+            # (and if needed fetched) the lineage. Leaving any of them out made
+            # every trial run compleasm against the empty default library --
+            # downloading the lineage again despite --compleasm-download-path --
+            # and silently ignored --no-compleasm and --compleasm-bin.
+            download_path=self.evaluator.download_path,
+            compleasm_bin=self.evaluator.compleasm_bin,
+            compleasm_download_path=self.evaluator.compleasm_download_path,
+            use_compleasm=self.evaluator.use_compleasm,
+            subset_seed=self.evaluator.subset_seed,
             ont=self.ont,
             kmer_eval=self.kmer_eval,
             include_busco=self.include_busco,
@@ -226,6 +292,7 @@ class ObjectiveBuilder:
             n_haplotypes=2
             if ((self.hic1 and self.hic2) or (self.ul and not self.primary))
             else 1,
+            bits_cap=self.bits_cap,
         )
 
     def _objective_values(self, metrics, evaluator, trial_id):
@@ -281,7 +348,7 @@ class ObjectiveBuilder:
         "n50": "down",
     }
 
-    def _make_gate(self, trial, evaluator, burn_in=False):
+    def _make_gate(self, trial, evaluator):
         """
         Build the post-gfastats check that prunes a collapsed assembly early.
 
@@ -292,8 +359,10 @@ class ObjectiveBuilder:
         moves on without paying for yak and completeness on an assembly already
         known to be bad.
 
-        The threshold is a log2 fold change against the *default-parameter
-        baseline*, so the bar is identical for the whole study. Measured
+        The threshold is in bits against the *default-parameter baseline* --
+        the same per-metric bits the score is built from, so ``--prune-bits
+        1`` prunes exactly what would score -1 or worse on two gated metrics --
+        and the bar is identical for the whole study. Measured
         against the running best it ratcheted: every improvement tightened the
         gate on every later trial, and a study that found one good assembly
         early then pruned nearly everything after it.
@@ -302,13 +371,13 @@ class ObjectiveBuilder:
         difference are strongly coupled, so one drifting past the threshold is
         ordinary variation; ``prune_min_metrics`` going at once is a collapse.
 
-        Returns None (no gating) during the burn-in: those trials measure how
-        far each metric moves, and pruning them would estimate that from a
-        sample with its own bad tail cut off.
+        Compared on uncapped bits: the cap bounds a metric's pull on the score,
+        it is not meant to hide the size of a collapse from the gate.
+
+        Returns None (no gating) for the baseline, which has nothing to be
+        compared against yet.
         """
-        if burn_in:
-            return None
-        if self.prune_fc <= 0 or self.prune_min_metrics <= 0:
+        if self.prune_bits <= 0 or self.prune_min_metrics <= 0:
             return None
         if not evaluator.has_baseline:
             return None
@@ -318,33 +387,36 @@ class ObjectiveBuilder:
             for name, value in sorted(metrics.items()):
                 if name.split("_hap")[0] not in self.GATED_METRICS:
                     continue
-                fc = evaluator.fold_change(name, float(value))
-                if fc is None:
+                bits = evaluator.fold_change(name, float(value))
+                if bits is None:
                     continue
-                # fold_change is already signed so that negative means worse
-                # than the baseline, whichever way the metric runs.
-                if fc < -self.prune_fc:
-                    breaches.append((name, fc))
+                # Already signed so that negative means worse than the
+                # baseline, whichever way the metric runs.
+                if bits < -self.prune_bits:
+                    breaches.append((name, bits))
 
             if len(breaches) < self.prune_min_metrics:
                 return
 
-            detail = ", ".join(f"{n} {v:+.2f}" for n, v in breaches)
+            detail = ", ".join(f"{n} {v:+.2f} bits" for n, v in breaches)
             trial.set_user_attr("gfastats_gate", [n for n, _ in breaches])
+            trial.set_user_attr(
+                "gfastats_gate_bits", {n: float(v) for n, v in breaches}
+            )
             logging.info(
                 f"Trial {trial.number}: PRUNED - {len(breaches)} of the gated "
-                f"metrics are more than {self.prune_fc:.1f} log2 units worse "
+                f"metrics are more than {self.prune_bits:.1f} bits worse "
                 f"than the default-parameter baseline ({detail}). Skipping the "
                 "remaining metrics and moving to the next trial."
             )
             raise optuna.exceptions.TrialPruned(
-                f"{len(breaches)} gated metrics beyond -{self.prune_fc:.1f} log2FC"
+                f"{len(breaches)} gated metrics beyond -{self.prune_bits:.1f} bits"
             )
 
         return gate
 
     # -------------------------------------------------------------- objective
-    def build_objective(self, burn_in=False):
+    def build_objective(self):
         """
         Build and return the objective function for Optuna.
 
@@ -352,9 +424,11 @@ class ObjectiveBuilder:
         every later trial is scored against, so it scores exactly 0 and the
         sign of any other trial's score says whether it beat plain hifiasm.
 
-        ``burn_in`` selects the first phase: trial 0 plus a handful of random
-        parameter sets, none of them pruned, scored on raw fold changes because
-        the scales they exist to measure do not exist yet.
+        Every trial after it is scored in bits against that reference from the
+        start. There is no burn-in phase: bits are scale-free, so there is no
+        per-metric spread to measure before scoring can begin, and every trial
+        -- including TPE's random startup trials -- is an ordinary, gated
+        trial of the one study.
         """
 
         def objective(trial):
@@ -374,11 +448,14 @@ class ObjectiveBuilder:
             # in the study so that it shows up in the optimisation history as a
             # reference point; the parameter-importance plots filter it out
             # separately (see hifimizer.plot_param_importances).
-            if burn_in and trial_id == 0:
-                # Marked rather than identified by number: after the burn-in
-                # trials are copied into the main study the numbering shifts,
-                # and the final-assembly step needs to know whether the winner
-                # is this one.
+            # Trial 0 rather than "no baseline yet": the evaluator derives its
+            # failure policy from the trial number (0 retires a failing stage
+            # for the study, later trials are discarded instead), so the two
+            # must agree on which trial is the baseline.
+            is_baseline = trial_id == 0
+            if is_baseline:
+                # Also recorded as an attribute, which is what the
+                # final-assembly step checks to know whether the winner is it.
                 trial.set_user_attr("baseline", True)
                 params = {
                     "prefix": str(prefix),
@@ -446,16 +523,16 @@ class ObjectiveBuilder:
                                     "l_msjoin", 1, 10_000_000, log=True
                                 ),
                             ),
-                            # Scaffolding one haplotype through the other only
-                            # exists for a dual assembly, so it is offered as a
-                            # choice here and nowhere else.
-                            "dual_scaf": pick(
-                                "dual_scaf",
-                                lambda: trial.suggest_categorical(
-                                    "dual_scaf", [False, True]
-                                ),
-                            ),
                         }
+                    )
+
+                # Scaffolding one haplotype through the other only changes the
+                # scored assembly when hap1/hap2 are what is scored: Hi-C and
+                # ultra-long runs, never --primary.
+                if dual_scaf_supported(self.hic1, self.hic2, self.ul, self.primary):
+                    hic_params["dual_scaf"] = pick(
+                        "dual_scaf",
+                        lambda: trial.suggest_categorical("dual_scaf", [False, True]),
                     )
 
                 if self.ul:
@@ -492,6 +569,31 @@ class ObjectiveBuilder:
                                     "max_kocc", 1000, 5000, step=100
                                 ),
                             ),
+                            "k": pick(
+                                "k",
+                                lambda: trial.suggest_categorical(
+                                    "k", SENSITIVE_K_CHOICES
+                                ),
+                            ),
+                            "w": pick(
+                                "w",
+                                lambda: trial.suggest_categorical(
+                                    "w", SENSITIVE_W_CHOICES
+                                ),
+                            ),
+                            "max_od_ec": pick(
+                                "max_od_ec",
+                                lambda: trial.suggest_categorical(
+                                    "max_od_ec",
+                                    SENSITIVE_MAX_OD_EC_CHOICES[bool(self.ont)],
+                                ),
+                            ),
+                            "max_od_final": pick(
+                                "max_od_final",
+                                lambda: trial.suggest_categorical(
+                                    "max_od_final", SENSITIVE_MAX_OD_FINAL_CHOICES
+                                ),
+                            ),
                         }
                     )
 
@@ -521,6 +623,17 @@ class ObjectiveBuilder:
                 command += f" {self.input_reads}"
 
             try:
+                if self.sensitive:
+                    # -D, -N and --max-kocc act on the stages hifiasm skips when
+                    # it finds cached .bin files, so every --sensitive run has
+                    # to start from the raw reads.
+                    removed = delete_hifiasm_bins(prefix)
+                    if removed:
+                        logging.info(
+                            f"Trial {trial_id}: --sensitive - deleted "
+                            f"{len(removed)} cached hifiasm .bin file(s) so the "
+                            "sampled -D/-N/--max-kocc take effect."
+                        )
                 return_code, log_path = self.subprocess_logger.run_command_with_logging(
                     command=command,
                     log_filename="hifiasm.log",
@@ -591,7 +704,7 @@ class ObjectiveBuilder:
                     busco_lineage=self.busco_lineage,
                     extra_fasta_files=extra_fastas,
                     extra_gfa_files=extra_gfas,
-                    gate=self._make_gate(trial, evaluator, burn_in=burn_in),
+                    gate=None if is_baseline else self._make_gate(trial, evaluator),
                 )
 
                 if not metrics:
@@ -616,7 +729,7 @@ class ObjectiveBuilder:
                         f"Trial {trial_id}: failed to set metric user attrs: {e}"
                     )
 
-                if burn_in and trial_id == 0:
+                if is_baseline:
                     # Adopted before scoring, so trial 0 is a fold change
                     # against itself and lands at exactly 0.
                     evaluator.save_baseline_metrics(metrics)
@@ -710,6 +823,12 @@ class ObjectiveBuilder:
             ) as e:
                 stage = self._determine_failure_stage(e, gfa_file)
                 logging.error(f"Trial {trial_id}: Failed at {stage} - {str(e)}")
+                # Lets the --max-consecutive-pruned stop say what went wrong
+                # instead of blaming the gfastats gate.
+                try:
+                    trial.set_user_attr("failure", f"{stage}: {e}"[:500])
+                except Exception:
+                    pass
                 raise optuna.exceptions.TrialPruned(f"Trial pruned at {stage}: {e}")
 
             finally:
@@ -769,7 +888,7 @@ class ObjectiveBuilder:
             for metric_name, data in items:
                 logging.info(
                     f"    {metric_name:<26}{_fmt_raw(data):>18}"
-                    f"{_fmt(data, 'fc'):>10}{_fmt(data, 'z'):>9}"
+                    f"{_fmt(data, 'fc'):>10}{_fmt(data, 'bits'):>9}"
                 )
 
         logging.info(f"\nTrial {trial_id} metric report")
@@ -787,7 +906,7 @@ class ObjectiveBuilder:
                 )
 
         logging.info(
-            f"\n    {'metric':<26}{'value':>18}{'log2FC':>10}{'scaled':>9}"
+            f"\n    {'metric':<26}{'value':>18}{'bits':>10}{'capped':>9}"
         )
         _log_block("Maximize (higher is better)", maximize_metrics)
         _log_block("Minimize (lower is better)", minimize_metrics)
@@ -797,18 +916,29 @@ class ObjectiveBuilder:
                 unknown_metrics,
             )
 
+        groups = contribution_analysis.get("groups") or {}
+        if groups:
+            logging.info(
+                "\n  By group: "
+                + " | ".join(f"{g} {v:+.3f}" for g, v in groups.items())
+            )
+
         score = float(contribution_analysis["total_score"])
         verdict = (
             "better than the default assembly"
             if score > 0
             else ("the default assembly itself" if score == 0 else "worse than default")
         )
+        cap = evaluator.bits_cap if evaluator is not None else self.bits_cap
         unit = (
-            "importance x scaled"
-            if (evaluator is not None and evaluator.is_standardised)
-            else "importance x log2FC, burn-in: not yet scaled"
+            f"bits soft-capped at +/-{cap:.1f}"
+            if cap and cap > 0
+            else "bits, uncapped"
         )
-        logging.info(f"\n  Score {score:+.4f}  (sum of {unit} -- {verdict})\n")
+        logging.info(
+            f"\n  Score {score:+.4f}  (importance-weighted mean of {unit} -- "
+            f"{verdict})\n"
+        )
 
     @staticmethod
     def _determine_failure_stage(error, gfa_file):

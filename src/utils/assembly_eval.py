@@ -19,32 +19,102 @@ from utils.subprocess_logger import SubprocessLogger, TIMEOUT_EXIT_CODE
 from utils.paths import RunPaths
 
 
-#: log2 fold changes are clipped to this many doublings. A collapsed assembly
-#: can be a 500-fold regression on contig count, which at weight 1 would swamp
-#: every other metric combined; the gate should reject those anyway, and past
-#: ~32x a trial is bad by any reading.
-FC_CLIP = 5.0
+#: Soft cap on the bits any one metric can contribute, in either direction.
+#:
+#: A log2 fold change is already scale-free -- one bit is one doubling or one
+#: halving whatever the metric measures -- so no per-metric scale has to be
+#: estimated before scoring can start. What bits are *not* is bounded. A
+#: collapsed assembly can be a 500-fold regression on contig count (-9 bits),
+#: missing BUSCOs going 0 -> 60 is -5.9 bits, and a QV that climbs into the
+#: range where yak runs out of error k-mers can add +10 bits of noise. Any one
+#: of those, at weight 1, outvotes every other metric combined.
+#:
+#: The cap is applied as ``cap * tanh(bits / cap)`` rather than a hard clip:
+#: below about half the cap it is practically the identity (1 bit scores 0.98
+#: at a cap of 4), it saturates smoothly, and unlike a clip it keeps a 100x
+#: collapse ranked below a 20x one instead of tying them. 4 bits (16x) is past
+#: anything a parameter change does to a sane assembly, and the gfastats gate
+#: already prunes contiguity regressions beyond 1 bit. Overridden by
+#: ``--bits-cap``; 0 disables it.
+BITS_CAP = 4.0
 
 #: Added to count-like quantities before the ratio. Several are legitimately
 #: zero on a good assembly (missing BUSCOs, multi-copy, SVs), and x/0 is not a
 #: fold change.
 FC_PSEUDOCOUNT = 1.0
 
-#: Floor for the "deficit" quantities (k-mer completeness, trans-hap rate),
-#: which reach exactly zero on a perfect assembly.
-FC_DEFICIT_FLOOR = 0.01
+#: Pseudocounts for the three metrics that live next to a hard floor. Each is
+#: scored as a ratio of something that can approach zero -- the missing k-mer
+#: fraction, the trans-haplotype link rate, the consensus error rate -- and a
+#: ratio of two small numbers is mostly a ratio of measurement noise: k-mer
+#: completeness going 99.0 -> 99.9% would otherwise score +3.3 bits and outvote
+#: an N50 halving and a contig-count doubling combined.
+#:
+#: The pseudocount plays the same role as FC_PSEUDOCOUNT does for counts: it
+#: is roughly the resolution of the measurement, so differences well below it
+#: are worth little, differences well above it are scored almost unchanged,
+#: and the metric's reach is bounded on its own without a special-case cap.
 
-#: Standardised scores are clipped to this many scale units. A metric whose
-#: burn-in movement was tiny can otherwise turn an ordinary trial into a
-#: 50-unit outlier purely by having a small denominator.
-Z_CLIP = 5.0
+#: Percentage points added to the k-mer completeness deficit (100 - %).
+#: Bounds the best possible gain over a 99.0% baseline at log2(1.5/0.5) =
+#: 1.58 bits; a real 90 -> 95% gain still scores ~0.93 of its 1.0 bit.
+KMER_DEFICIT_PSEUDOCOUNT = 0.5
 
-#: Below this a metric did not move at all during the burn-in: it cannot tell
-#: one parameter set from another, so it is dropped rather than divided by.
-SCALE_MIN = 1e-6
+#: Stored when yak reports QV ``inf`` -- no erroneous k-mers found at all.
+#: That is a real result, the best one possible, so it is scored rather than
+#: dropped: at QV 100 the error rate (1e-10) is far below QV_ERROR_PSEUDOCOUNT,
+#: so it scores like any other QV beyond ~60. Dropping it instead removed QV
+#: from the trial's metric set, which made the trial incomparable with the rest.
+QV_CEILING = 100.0
 
-#: Burn-in trials a metric needs before it gets a scale.
-SCALE_MIN_OBSERVATIONS = 3
+#: Percentage points added to the Hi-C trans-haplotype link rate.
+TRANS_HAP_PSEUDOCOUNT = 0.1
+
+#: Added to the consensus error rate behind the QV: 1e-6 is QV 60, around
+#: where yak's estimate rests on a handful of error k-mers. QV 40 -> 43 still
+#: scores ~0.98 bits; QV 50 -> 60 scores 2.5 instead of 3.3.
+QV_ERROR_PSEUDOCOUNT = 1e-6
+
+#: How the scored metrics group into the properties a user actually cares
+#: about. Weights are still set per metric (weights.json); the groups are how
+#: the run reports what share of the score each property carries, because
+#: metrics inside a group move together -- contig count and N50 nearly always
+#: do -- so a group's total weight is its real vote, not any single entry.
+#: Per-haplotype metrics (``n50_hap1`` ...) belong to their base metric's group.
+METRIC_GROUPS = (
+    ("Contiguity", ("num_contigs", "n50", "length_diff")),
+    ("Gene space", ("missing", "fragmented", "multi_copy")),
+    ("Accuracy", ("qv", "kmer_completeness")),
+    ("Phasing", ("trans_hap_rate",)),
+)
+
+#: Weight keys that used to be scored and no longer are, with the reason, so a
+#: weights.json written for an earlier version says why rather than being
+#: reported as a typo.
+RETIRED_WEIGHT_KEYS = {
+    "single_copy": (
+        "it is determined by the other three BUSCO classes and barely moves in "
+        "bits; it is still measured and reported"
+    ),
+    "kmer_completeness_hap1": (
+        "only the combined k-mer completeness over both haplotypes is scored, "
+        "so the property is not counted twice in phased runs"
+    ),
+    "kmer_completeness_hap2": (
+        "only the combined k-mer completeness over both haplotypes is scored, "
+        "so the property is not counted twice in phased runs"
+    ),
+}
+
+
+def metric_group(name):
+    """The group a metric belongs to, or ``"Other"``."""
+    # Only a trailing haplotype suffix: "trans_hap_rate" has "_hap" inside it.
+    base = re.sub(r"_hap[12]$", "", name)
+    for group, members in METRIC_GROUPS:
+        if base in members:
+            return group
+    return "Other"
 
 
 class CompletenessFailedError(RuntimeError):
@@ -147,8 +217,6 @@ class AssemblyEvaluator:
             "hap2_length_mb",
             "qv_hap1",
             "qv_hap2",
-            "kmer_completeness_hap1",
-            "kmer_completeness_hap2",
         }
     )
 
@@ -164,8 +232,6 @@ class AssemblyEvaluator:
         "hap2_length_mb": "Mb",
         "qv_hap1": "Phred",
         "qv_hap2": "Phred",
-        "kmer_completeness_hap1": "%",
-        "kmer_completeness_hap2": "%",
         "num_contigs_hap1": "",
         "num_contigs_hap2": "",
         "n50_hap1": "bp",
@@ -236,8 +302,6 @@ class AssemblyEvaluator:
                 "kmer_completeness",
                 "qv_hap1",
                 "qv_hap2",
-                "kmer_completeness_hap1",
-                "kmer_completeness_hap2",
             ),
             walltime_flag="--yak-walltime",
         ),
@@ -296,6 +360,7 @@ class AssemblyEvaluator:
         hic_min_mapq=20,
         hic_phasing=True,
         n_haplotypes=1,
+        bits_cap=BITS_CAP,
     ):
         """
         Args:
@@ -325,6 +390,8 @@ class AssemblyEvaluator:
             failure_policy: Override for how a stage failure is handled; see
                 :attr:`failure_policy`. Normally left as ``None`` so it is
                 derived from ``trial_id``.
+            bits_cap: Soft cap on each metric's bits; see :data:`BITS_CAP`.
+                0 or ``None`` disables it.
         """
         self.known_genome_size = known_genome_size
         self.input_reads = Path(input_reads)
@@ -347,6 +414,7 @@ class AssemblyEvaluator:
         # 2 for Hi-C / ultra-long runs, which produce hap1 and hap2. Decides
         # whether the split metrics are scored per haplotype or unsuffixed.
         self.n_haplotypes = max(1, int(n_haplotypes))
+        self.bits_cap = float(bits_cap) if bits_cap else 0.0
 
         self.stage_walltimes = dict(self.DEFAULT_STAGE_WALLTIMES)
         self.stage_walltimes.update(
@@ -398,11 +466,6 @@ class AssemblyEvaluator:
         # until trial 0 has been measured.
         self.baseline_metrics = self._read_json(
             self.paths.baseline_metrics, "baseline metrics"
-        )
-        # How far each metric typically moves, measured over the burn-in.
-        # Empty during the burn-in itself.
-        self.metric_scales = self._read_json(
-            self.paths.metric_scales, "metric scales"
         )
         #: per-evaluation outcome, ``{stage_name: bool}``; reset by
         #: :meth:`evaluate_assembly`
@@ -486,9 +549,6 @@ class AssemblyEvaluator:
         # to compare against.
         self.baseline_metrics = self._read_json(
             self.paths.baseline_metrics, "baseline metrics"
-        )
-        self.metric_scales = self._read_json(
-            self.paths.metric_scales, "metric scales"
         )
         return self.stage_state
 
@@ -848,8 +908,16 @@ class AssemblyEvaluator:
             cwd: Working directory for the command.
 
         Returns:
-            The contents of the log file the command wrote to.
+            What this invocation wrote to its log file -- not the whole file.
+            Logs are appended to and outlive ``--force-rerun``, and trial
+            numbers restart at 0 in a new study, so the file can already hold
+            an earlier run's output under the same name; parsers that take the
+            first match would otherwise read that instead.
         """
+        log_file = self.subprocess_logger.log_path_for(
+            f"{command_name}.log", self.trial_id
+        )
+        start = log_file.stat().st_size if log_file.exists() else 0
         try:
             return_code, log_path = self.subprocess_logger.run_command_with_logging(
                 command=command,
@@ -878,6 +946,7 @@ class AssemblyEvaluator:
                 raise RuntimeError(f"{command_name} failed - see {log_path}")
 
             with open(log_path, "r") as f:
+                f.seek(start)
                 return f.read()
 
         except (RuntimeError, TimeoutError):
@@ -902,12 +971,14 @@ class AssemblyEvaluator:
             )
             return None
 
-        lineage_dir = self.download_path / "lineages" / lineage
-        if lineage_dir.exists():
-            self.logger.debug(
-                f"BUSCO lineage '{lineage}' already present in {self.download_path}."
+        local = self.resolve_busco_lineage(lineage)
+        if local is not None:
+            self.logger.info(
+                f"BUSCO lineage '{lineage}' already present at {local}. "
+                "Skipping download."
             )
-            return lineage_dir
+            return local
+        lineage_dir = self.download_path / "lineages" / lineage
 
         self.download_path.mkdir(parents=True, exist_ok=True)
         command = f"busco --download_path {self.download_path} --download {lineage}"
@@ -1013,7 +1084,8 @@ class AssemblyEvaluator:
         ``QV`` carries two values: the naive estimate and the model-calibrated
         one.  yak sets the calibrated value to -1 when the read histogram is
         too shallow to fit the model (``max_c <= 4``), in which case we fall
-        back to the raw estimate.
+        back to the raw estimate. ``inf`` (no erroneous k-mers at all) is
+        stored as :data:`QV_CEILING`.
 
         Returns:
             dict with ``qv`` (Phred) and ``kmer_completeness`` (percent).
@@ -1042,6 +1114,9 @@ class AssemblyEvaluator:
             qv = qv_raw
         else:
             qv = 0.0
+        # inf: yak found no erroneous k-mers. See QV_CEILING.
+        if np.isinf(qv):
+            qv = QV_CEILING
 
         completeness = (cov * 100.0) if cov and cov > 0 else 0.0
         # CV is a ratio of estimates and can marginally exceed 1.0.
@@ -1104,12 +1179,10 @@ class AssemblyEvaluator:
             return primary
 
         primary["qv_hap1"] = primary["qv"]
-        primary["kmer_completeness_hap1"] = primary["kmer_completeness"]
 
         # --- second haplotype, measured on its own ---
-        # Consensus accuracy and k-mer completeness are both per-haplotype
-        # quantities, so with two haplotypes there are two of each and scoring
-        # only the first leaves hap2 out of the objective entirely.
+        # Consensus accuracy is a per-haplotype quantity, so with two
+        # haplotypes the QV is the mean of both rather than hap1's alone.
         hap2_out = tdir / "yak_qv.hap2.txt"
         self.run_command(
             f"yak qv -t{self.threads} -K{chunk} "
@@ -1119,16 +1192,14 @@ class AssemblyEvaluator:
         )
         hap2 = self.parse_yak_qv(hap2_out)
         primary["qv_hap2"] = hap2["qv"]
-        primary["kmer_completeness_hap2"] = hap2["kmer_completeness"]
         primary["qv"] = (primary["qv_hap1"] + hap2["qv"]) / 2.0
 
         # --- completeness on the full (diploid) assembly ---
-        # Kept alongside the per-haplotype figures rather than replaced by
-        # them. Per-haplotype completeness is structurally capped by
-        # heterozygosity and is *higher* for a collapsed assembly that packed
-        # both alleles into one haplotype, so on its own it rewards exactly
-        # the failure mode Hi-C phasing is meant to avoid. The combined figure
-        # is the only metric here that penalises that collapse.
+        # The only k-mer completeness reported in a phased run. Per-haplotype
+        # completeness is structurally capped by heterozygosity and is
+        # *higher* for a collapsed assembly that packed both alleles into one
+        # haplotype, so it rewards exactly the failure mode Hi-C phasing is
+        # meant to avoid; the combined figure is the one that penalises it.
         combined = self._combine_fastas(
             [fasta_file] + list(extra_fasta_files), tdir / "combined_haps.fasta"
         )
@@ -1177,13 +1248,11 @@ class AssemblyEvaluator:
 
         per_hap = []
         for index, gfa in enumerate(gfas, start=1):
-            # A distinct command_name per haplotype is load-bearing, not
-            # cosmetic. run_command returns the *contents of the log file*, and
-            # the subprocess logger opens it in append mode, so two runs
-            # sharing a name write into one file. parse_gfastats_output uses
-            # re.search, which returns the first match -- so hap2 would be
-            # parsed out of hap1's output and both haplotypes would report
-            # identical contig counts, N50 and length.
+            # A distinct command_name per haplotype keeps each haplotype's
+            # gfastats output in its own log. run_command only returns what
+            # the current invocation wrote, so this is no longer what keeps
+            # hap2 from being parsed out of hap1's output, but one log per
+            # haplotype is still the readable layout.
             name = "gfastats" if len(gfas) == 1 else f"gfastats_hap{index}"
             try:
                 stdout = self.run_command(
@@ -1370,6 +1439,77 @@ class AssemblyEvaluator:
         """True if compleasm should and can be used."""
         return bool(self.use_compleasm and self.compleasm_bin)
 
+    @staticmethod
+    def split_lineage(lineage):
+        """
+        ``"metazoa_odb12"`` -> ``("metazoa", "odb12")``.
+
+        compleasm takes the OrthoDB version as a separate ``--odb`` (default
+        odb12) and rebuilds the lineage name as ``<first word>_<odb>``, so a
+        library holding ``metazoa_odb10`` is never found unless ``--odb odb10``
+        is passed along with it. A bare name gets compleasm's default.
+        """
+        name = Path(str(lineage)).name
+        match = re.match(r"^(.+?)_(odb\d+(?:\.\d+)?)$", name)
+        if match:
+            return match.group(1), match.group(2)
+        return name, "odb12"
+
+    def _resolve_compleasm_library(self, lineage):
+        """
+        Accept either compleasm's library root or one lineage directory in it.
+
+        ``-L`` must be the root (the folder holding ``<lineage>/`` and
+        ``<lineage>.done``). Pointing ``--compleasm-download-path`` at the
+        lineage folder itself is an easy mistake, and compleasm's response is
+        to download a fresh copy *inside* it, so the root is recovered here.
+        """
+        base, odb = self.split_lineage(lineage)
+        full = f"{base}_{odb}"
+        lib = self.compleasm_download_path
+        if (
+            lib.name == full
+            and not (lib / full).exists()
+            and ((lib / "hmms").exists() or (lib / "scores_cutoff").exists())
+        ):
+            self.logger.info(
+                f"{lib} is the '{full}' lineage itself; using its parent "
+                f"{lib.parent} as the compleasm library."
+            )
+            self.compleasm_download_path = lib.parent
+        return self.compleasm_download_path
+
+    def compleasm_library_missing(self, lineage):
+        """
+        What compleasm would still download from this library, or ``[]``.
+
+        compleasm 0.2.9 does not look at the lineage directory to decide: it
+        trusts ``<lineage>.done`` markers, and every ``compleasm run`` also
+        insists on ``eukaryota_<odb>`` (its default lineage) and a cached
+        ``file_versions.tsv``. A library with the lineage directory but no
+        marker -- e.g. one copied without its dot-files -- is downloaded again.
+        """
+        base, odb = self.split_lineage(lineage)
+        lib = self._resolve_compleasm_library(lineage)
+        wanted = [f"{base}_{odb}.done", f"eukaryota_{odb}.done", "file_versions.tsv"]
+        return [name for name in dict.fromkeys(wanted) if not (lib / name).exists()]
+
+    def resolve_busco_lineage(self, lineage):
+        """
+        The local BUSCO dataset directory for ``lineage``, or None.
+
+        Accepts the BUSCO download root (``<root>/lineages/<lineage>``, what
+        ``busco --download_path`` writes), its ``lineages`` folder, or the
+        dataset directory itself, so a user-supplied path is found in any of
+        the three forms rather than triggering a download.
+        """
+        name = Path(str(lineage)).name
+        root = self.download_path
+        for candidate in (root / "lineages" / name, root / name, root):
+            if candidate.name == name and (candidate / "dataset.cfg").exists():
+                return candidate
+        return None
+
     # ---------------------------------------------------------- compleasm run
     def download_compleasm_lineage(self, lineage="metazoa_odb12"):
         """
@@ -1382,20 +1522,35 @@ class AssemblyEvaluator:
         if not self.compleasm_available():
             return None
 
-        lineage_dir = self.compleasm_download_path / lineage
-        if lineage_dir.exists() and any(lineage_dir.iterdir()):
+        base, odb = self.split_lineage(lineage)
+        full = f"{base}_{odb}"
+        lib = self._resolve_compleasm_library(lineage)
+        lineage_dir = lib / full
+        missing = self.compleasm_library_missing(lineage)
+        if not missing:
             self.logger.info(
-                f"compleasm lineage '{lineage}' already present in "
-                f"{self.compleasm_download_path}. Skipping download."
+                f"compleasm lineage '{full}' already present in {lib}. "
+                "Skipping download."
             )
             return lineage_dir
 
-        self.compleasm_download_path.mkdir(parents=True, exist_ok=True)
+        if lineage_dir.exists() and f"{full}.done" in missing:
+            self.logger.warning(
+                f"{lineage_dir} exists but {lib / (full + '.done')} does not. "
+                "compleasm only trusts its .done markers, so it will download "
+                "this lineage again. If the directory is a complete copy, "
+                "copy its .done file alongside it (or create it) to reuse it."
+            )
+        self.logger.info(
+            f"compleasm library {lib} is missing {', '.join(missing)}; "
+            f"downloading '{full}' (compleasm also fetches its default "
+            f"eukaryota_{odb} lineage)."
+        )
+        lib.mkdir(parents=True, exist_ok=True)
         command = (
             f"{self._compleasm_env_prefix()}{self.compleasm_bin} download "
-            f"{lineage} -L {self.compleasm_download_path}"
+            f"{base} --odb {odb} -L {lib}"
         )
-        self.logger.info(f"Downloading compleasm lineage '{lineage}'")
         self.run_command(command, command_name="compleasm_download")
         return lineage_dir
 
@@ -1419,10 +1574,12 @@ class AssemblyEvaluator:
         if out_dir.exists():
             shutil.rmtree(out_dir, ignore_errors=True)
 
+        base, odb = self.split_lineage(lineage)
+        lib = self._resolve_compleasm_library(lineage)
         command = (
             f"{self._compleasm_env_prefix()}{self.compleasm_bin} run "
-            f"-a {fasta_file} -o {out_dir} -l {lineage} "
-            f"-t {self.threads} -L {self.compleasm_download_path}"
+            f"-a {fasta_file} -o {out_dir} -l {base} --odb {odb} "
+            f"-t {self.threads} -L {lib}"
         )
 
         self.logger.info(
@@ -1554,12 +1711,22 @@ class AssemblyEvaluator:
         out_name = "busco_output"
         out_dir = tdir / out_name
 
+        # A dataset that is already on disk is passed by path and run with
+        # --offline. Without --offline BUSCO checks the server for a newer
+        # version of the lineage on every run and downloads it if there is
+        # one -- which both ignores a user-supplied dataset and can change the
+        # lineage between trials. Only a dataset not found locally is left to
+        # BUSCO to fetch.
+        local = self.resolve_busco_lineage(lineage)
+        lineage_arg = str(local) if local is not None else lineage
+        offline = " --offline" if local is not None else ""
+
         # BUSCO's -o must be a bare name; the location is set with --out_path.
         command = (
-            f"busco -i {fasta_file} -l {lineage} -m {mode} "
+            f"busco -i {fasta_file} -l {lineage_arg} -m {mode} "
             f"-o {out_name} --out_path {tdir} "
             f"-c {self.threads} --skip_bbtools --force "
-            f"--download_path {self.download_path} --{backend}"
+            f"--download_path {self.download_path} --{backend}{offline}"
         )
 
         self.logger.info(
@@ -1899,21 +2066,19 @@ class AssemblyEvaluator:
             "n50_hap1": 0.5,
             "n50_hap2": 0.5,
             # Gene space. The three deficits carry the signal, because they can
-            # halve or double; single_copy is a bounded count that barely moves
-            # proportionally (605 -> 610 out of 672 is 0.8%), so it is priced
-            # low rather than pretending otherwise.
-            "single_copy": 0.2,
+            # halve or double. single_copy is not scored: it is the remainder
+            # of the other three, and as a bounded count it barely moves in
+            # bits (605 -> 610 out of 672 is 0.012 bits).
             "multi_copy": 0.7,
             "fragmented": 0.7,
             "missing": 1.0,
             # k-mer metrics, both scored on what the assembly is *short of*
             # rather than the percentage itself (see `badness`), so halving the
             # missing k-mers or halving the error rate behind the QV each move
-            # one unit, like everything else here.
+            # one unit, like everything else here. One k-mer completeness in
+            # every mode: in a phased run it is measured over both haplotypes.
             "qv": 1.0,
             "kmer_completeness": 1.0,
-            "kmer_completeness_hap1": 0.5,
-            "kmer_completeness_hap2": 0.5,
             # Hi-C phasing. Halving the cross-haplotype link rate is worth as
             # much as halving the contig count: a well-phased assembly and a
             # contiguous one are meant to trade off, not for one to dominate.
@@ -1967,9 +2132,18 @@ class AssemblyEvaluator:
                         "Make them positive to silence this."
                     )
 
+                retired = sorted(set(loaded) & set(RETIRED_WEIGHT_KEYS))
+                for key in retired:
+                    log.warning(
+                        f"Ignoring '{key}' in {candidate}: it is no longer "
+                        f"scored -- {RETIRED_WEIGHT_KEYS[key]}."
+                    )
+
                 # Silently ignoring these used to make a typo look like it had
                 # worked; the objective simply never changed.
-                unknown = sorted(set(loaded) - set(default_weights))
+                unknown = sorted(
+                    set(loaded) - set(default_weights) - set(RETIRED_WEIGHT_KEYS)
+                )
                 if unknown:
                     log.warning(
                         f"Ignoring unrecognised weight key(s) in {candidate}: "
@@ -2014,8 +2188,7 @@ class AssemblyEvaluator:
         # the single-objective metric list.
         split = list(self.HAPLOTYPE_SPLIT_METRICS)
         if self.n_haplotypes < 2:
-            drop = [f"{m}_hap{i}" for m in split + ["kmer_completeness"]
-                    for i in (1, 2)]
+            drop = [f"{m}_hap{i}" for m in split for i in (1, 2)]
         else:
             drop = split
         for metric in drop:
@@ -2025,14 +2198,12 @@ class AssemblyEvaluator:
         # against, so it cannot be scored. Dropping it here rather than at
         # scoring time keeps metric_regime honest about what the study is
         # actually optimising.
+        #
+        # Nothing is dropped for being "too steady". Bits need no scale, so a
+        # metric that rarely moves simply contributes ~0 until a parameter set
+        # does move it -- which is information, not noise.
         if self.baseline_metrics:
             for metric in [m for m in weights if m not in self.baseline_metrics]:
-                weights.pop(metric, None)
-
-        # Likewise a metric that never moved during the burn-in has no scale to
-        # be divided by, and scoring it would only add noise.
-        if self.metric_scales:
-            for metric in [m for m in weights if m not in self.metric_scales]:
                 weights.pop(metric, None)
         return weights
 
@@ -2080,95 +2251,46 @@ class AssemblyEvaluator:
 
         Every metric is then compared by the same ratio against the baseline,
         so nothing downstream needs to know which way a metric runs. Three
-        families need more than a pseudocount:
+        families need more than the count pseudocount:
 
         ``qv``
             Phred is already the logarithm of an error rate, so a ratio of QVs
             is a ratio of logarithms: 50 -> 45 reads as a 9% change when it is
             really 3.2x more errors. Converting back to the error rate makes a
-            3.01 dB gain exactly one halving.
+            3.01 dB gain one halving -- plus :data:`QV_ERROR_PSEUDOCOUNT`, so
+            QVs past ~60, where yak's estimate is noise, stop paying out.
         ``kmer_completeness``
             Bounded at 100%, so the ratio of the percentages barely moves --
             99.0 -> 99.5 is a factor of 1.005. What actually halved is the
-            *deficit*, and that is the quantity worth scoring.
+            *deficit*, and that is the quantity worth scoring, plus
+            :data:`KMER_DEFICIT_PSEUDOCOUNT` so that the last few tenths of a
+            percent below 100 cannot dominate the score.
         ``trans_hap_rate``
             Also a percentage, and legitimately zero on a perfectly phased
-            assembly, so it takes the same floor as the deficit above.
+            assembly, so it takes :data:`TRANS_HAP_PSEUDOCOUNT` the same way.
         """
         if name.startswith("qv"):
-            return 10.0 ** (-raw / 10.0)
+            return 10.0 ** (-raw / 10.0) + QV_ERROR_PSEUDOCOUNT
         if name.startswith("kmer_completeness"):
-            return max(100.0 - raw, FC_DEFICIT_FLOOR)
+            return max(100.0 - raw, 0.0) + KMER_DEFICIT_PSEUDOCOUNT
         if name == "trans_hap_rate":
-            return max(raw, FC_DEFICIT_FLOOR)
+            return max(raw, 0.0) + TRANS_HAP_PSEUDOCOUNT
         if name in cls.HIGHER_IS_BETTER:
             # 1/x turns "more is better" into "less is better" without needing
             # a sign anywhere downstream.
             return 1.0 / (raw + FC_PSEUDOCOUNT)
         return raw + FC_PSEUDOCOUNT
 
-    @staticmethod
-    def compute_metric_scales(observations, keys):
+    def cap_bits(self, bits):
         """
-        The typical size of each metric's fold change during the burn-in.
+        Soft-cap one metric's bits at ``+/- bits_cap`` (see :data:`BITS_CAP`).
 
-        ``observations`` is one ``{metric: log2FC}`` dict per burn-in trial,
-        **excluding the baseline** -- its fold change against itself is zero by
-        construction and would only deflate the scale.
-
-        The statistic is the root mean square about *zero*, not the standard
-        deviation about the burn-in mean, because the scores it will divide are
-        themselves measured from the baseline rather than from the mean. If
-        every random parameter set lands 4x worse than default but tightly
-        clustered, the standard deviation is near zero and an entirely typical
-        trial scores -28; the RMS is 2.0 and the same trial scores -1.0, which
-        is the honest reading.
-
-        A metric that never moved gets no scale, which drops it from the score
-        for the rest of the study: it cannot separate one trial from another.
+        Odd and monotonic, so the sign and the ranking of every fold change
+        survive; only how far a single metric can pull the sum is bounded.
         """
-        scales = {}
-        for key in keys:
-            values = [
-                float(o[key])
-                for o in observations
-                if key in o and o[key] is not None and np.isfinite(o[key])
-            ]
-            if len(values) < SCALE_MIN_OBSERVATIONS:
-                continue
-            rms = float(np.sqrt(np.mean(np.square(values))))
-            if not np.isfinite(rms) or rms <= SCALE_MIN:
-                continue
-            scales[key] = {"scale": rms, "n": len(values)}
-        return scales
-
-    def save_metric_scales(self, scales):
-        """Persist the burn-in scales and adopt them for this evaluator."""
-        self.metric_scales = dict(scales)
-        self._write_json(self.paths.metric_scales, self.metric_scales, "metric scales")
-
-    def standardised(self, name, stored_value):
-        """
-        The metric's fold change divided by how much it typically moves.
-
-        Returns None during the burn-in, when there is no scale yet, so callers
-        can fall back to the raw fold change.
-        """
-        fc = self.fold_change(name, stored_value)
-        if fc is None:
-            return None
-        entry = self.metric_scales.get(name)
-        if not entry:
-            return None
-        scale = float(entry.get("scale", 0.0))
-        if not np.isfinite(scale) or scale <= SCALE_MIN:
-            return None
-        return float(np.clip(fc / scale, -Z_CLIP, Z_CLIP))
-
-    @property
-    def is_standardised(self) -> bool:
-        """True once the burn-in has produced usable scales."""
-        return bool(self.metric_scales)
+        if not self.bits_cap or self.bits_cap <= 0:
+            return float(bits)
+        return float(self.bits_cap * np.tanh(bits / self.bits_cap))
 
     def save_baseline_metrics(self, metrics):
         """Record the default-parameter assembly and adopt it as the reference."""
@@ -2183,8 +2305,13 @@ class AssemblyEvaluator:
 
     def fold_change(self, name, stored_value):
         """
-        log2 fold change of one metric against the baseline, signed so that
-        **positive always means better**.
+        log2 fold change of one metric against the baseline -- its change in
+        **bits** -- signed so that **positive always means better**.
+
+        Bits are what makes the metrics commensurable without measuring them
+        first: +1 is "twice as good" for contig count, N50, missing BUSCOs and
+        the QV error rate alike, so an importance weight buys the same thing on
+        every metric and no burn-in is needed to put them on one scale.
 
         log2 rather than a plain ratio because a plain ratio is asymmetric: a
         doubling moves 1.0 away from "no change" while a halving moves only
@@ -2198,6 +2325,10 @@ class AssemblyEvaluator:
 
         Returns None when the baseline never measured this metric, which is the
         signal that it cannot be scored (see :meth:`active_weights`).
+
+        Uncapped: the gfastats gate and the log want the real size of the
+        change. The cap is applied by :meth:`scored_value`, which is what the
+        weight multiplies.
         """
         base = self.baseline_metrics.get(name)
         if base is None:
@@ -2216,24 +2347,20 @@ class AssemblyEvaluator:
         lfc = float(np.log2(b_base / b_trial))
         if not np.isfinite(lfc):
             return 0.0
-        return float(np.clip(lfc, -FC_CLIP, FC_CLIP))
+        return lfc
 
     def scored_value(self, name, value):
         """
-        What the weight multiplies.
+        What the weight multiplies: the metric's bits, soft-capped.
 
-        Before the burn-in has produced scales, the raw log2 fold change. After
-        it, that fold change divided by how far the metric typically moves, so
-        that a weight buys the same thing on a volatile metric as on a steady
-        one.
+        The same for every trial from the first to the last, which is what
+        lets a single study hold them all: Optuna fixes a trial's value when it
+        is recorded, and nothing here changes after the baseline is measured.
         """
         fc = self.fold_change(name, value)
         if fc is None:
             return 0.0
-        if not self.metric_scales:
-            return fc
-        z = self.standardised(name, value)
-        return 0.0 if z is None else z
+        return self.cap_bits(fc)
 
     @property
     def has_baseline(self) -> bool:
@@ -2243,15 +2370,53 @@ class AssemblyEvaluator:
     # ---------------------------------------------------------------- scoring
     def calculate_weighted_sum(self, metrics):
         """
-        Sum of ``importance x log2 fold change`` over every scored metric.
+        Weighted **mean** of the capped bits over every scored metric:
+        ``sum(w * bits) / sum(w)``.
+
+        A mean rather than a sum so that the score means the same thing in
+        every mode. A HiFi-only run, a Hi-C run with the phasing metric and a
+        run that retired a stage at trial 0 all score different numbers of
+        metrics; as a sum their scores lived on different scales, and the
+        convergence thresholds -- absolute numbers -- meant something different
+        in each. As a mean the score always reads "average bits gained per
+        unit of importance": +0.10 is a tenth of a doubling, across the board.
+        Rankings are unchanged, since the denominator is the same for every
+        trial of one metric regime.
 
         The baseline assembly scores exactly 0 by construction, so the sign of
         a trial's score says directly whether it beat plain hifiasm.
         """
-        return sum(
-            weight * self.scored_value(name, metrics[name])
-            for name, weight in self.weights_for(metrics).items()
+        weights = self.weights_for(metrics)
+        total_weight = sum(weights.values())
+        if total_weight <= 0:
+            return 0.0
+        return (
+            sum(
+                weight * self.scored_value(name, metrics[name])
+                for name, weight in weights.items()
+            )
+            / total_weight
         )
+
+    def weight_groups(self, weights=None):
+        """
+        ``[(group, total_weight, share, [metrics])]`` for the given weights
+        (default: :meth:`active_weights`), in :data:`METRIC_GROUPS` order.
+
+        ``share`` is the group's fraction of the total weight, i.e. the most
+        of the weighted mean it can move.
+        """
+        weights = self.active_weights() if weights is None else weights
+        total = sum(weights.values()) or 1.0
+        order = [g for g, _ in METRIC_GROUPS] + ["Other"]
+        rows = []
+        for group in order:
+            members = sorted(m for m in weights if metric_group(m) == group)
+            if not members:
+                continue
+            w = sum(weights[m] for m in members)
+            rows.append((group, w, w / total, members))
+        return rows
 
     def analyze_metric_contributions(self, metrics):
         """
@@ -2259,27 +2424,39 @@ class AssemblyEvaluator:
 
         ``raw_value`` is the measurement back-transformed out of log space so
         the log is readable (a contig N50 of 34 Mb is useful information,
-        ``17.34`` is not); ``fc`` is its log2 fold change against the baseline,
+        ``17.34`` is not); ``fc`` is its change in bits against the baseline,
         positive when the trial is better, and None for a metric the baseline
-        never measured.
+        never measured; ``bits`` is that value after the cap, i.e. what the
+        weight actually multiplied. ``groups`` splits the total by
+        :data:`METRIC_GROUPS`; the group contributions sum to the total.
         """
         rows = {}
         total = 0.0
+        groups = {}
+        weights = self.weights_for(metrics)
+        total_weight = sum(weights.values()) or 1.0
 
-        for name, weight in self.weights_for(metrics).items():
+        for name, weight in weights.items():
             value = float(metrics[name])
             fc = self.fold_change(name, value)
-            total += weight * self.scored_value(name, value)
+            scored = self.scored_value(name, value)
+            share = weight * scored / total_weight
+            total += share
+            group = metric_group(name)
+            groups[group] = groups.get(group, 0.0) + share
             rows[name] = {
                 "log_value": value,
                 "raw_value": self.raw_value(name, value),
                 "unit": self.METRIC_UNITS.get(name, ""),
                 "weight": weight,
                 "fc": fc,
-                "z": self.standardised(name, value),
+                "bits": None if fc is None else scored,
+                "group": group,
             }
 
-        return {"total_score": total, "contributions": rows}
+        order = [g for g, _ in METRIC_GROUPS] + ["Other"]
+        groups = {g: groups[g] for g in order if g in groups}
+        return {"total_score": total, "contributions": rows, "groups": groups}
 
     # ------------------------------------------------------------- evaluation
     def evaluate_assembly(
@@ -2350,12 +2527,12 @@ class AssemblyEvaluator:
         def absorb(ok, value):
             if not (ok and value):
                 return
-            # A non-finite measurement cannot be summed, averaged or
-            # standardised, so it is dropped here rather than allowed to reach
-            # the score. yak reports a QV of `inf` when it finds no k-mer
-            # errors at all, which is a real result but not a usable number:
-            # it made the burn-in mean `inf` and the spread `nan`, and every
-            # trial afterwards scored `nan`.
+            # A non-finite measurement cannot be summed or turned into bits,
+            # so it is dropped here rather than allowed to reach the score.
+            # yak reports a QV of `inf` when it finds no k-mer errors at all,
+            # which is a real result but not a usable number: as a baseline it
+            # would make every later trial's QV a fold change against
+            # infinity.
             for name, v in value.items():
                 try:
                     finite = np.isfinite(float(v))

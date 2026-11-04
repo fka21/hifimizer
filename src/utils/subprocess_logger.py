@@ -93,6 +93,12 @@ class SubprocessLogger:
             pass
 
     # ------------------------------------------------------------------- run
+    def log_path_for(self, log_filename: str, trial_id: Optional[int] = None) -> Path:
+        """Where :meth:`run_command_with_logging` writes this command's log."""
+        if trial_id is not None:
+            log_filename = f"trial_{trial_id}_{log_filename}"
+        return self.logs_dir / log_filename
+
     def run_command_with_logging(
         self,
         command: str,
@@ -117,10 +123,7 @@ class SubprocessLogger:
         Returns:
             Tuple of (return_code, log_file_path)
         """
-        if trial_id is not None:
-            log_filename = f"trial_{trial_id}_{log_filename}"
-
-        log_file_path = self.logs_dir / log_filename
+        log_file_path = self.log_path_for(log_filename, trial_id)
 
         with open(log_file_path, "a") as f:
             f.write(f"\n{'=' * 60}\n")

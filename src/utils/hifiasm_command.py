@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 #: a parameter is a single-file change.
 HIFIASM_PARAM_KEYS = (
     "x", "y", "s", "n", "m", "p", "u",
-    "D", "N", "max_kocc",
+    "D", "N", "max_kocc", "k", "w", "max_od_ec", "max_od_final",
     "s_base", "f_perturb", "l_msjoin",
     "path_max", "path_min",
     "dual_scaf",
@@ -32,6 +32,10 @@ HIFIASM_FLAG_TO_PARAM = {
     "-D": ("D", int),
     "-N": ("N", int),
     "--max-kocc": ("max_kocc", int),
+    "-k": ("k", int),
+    "-w": ("w", int),
+    "--max-od-ec": ("max_od_ec", float),
+    "--max-od-final": ("max_od_final", float),
     "--s-base": ("s_base", float),
     "--f-perturb": ("f_perturb", float),
     "--l-msjoin": ("l_msjoin", int),
@@ -132,6 +136,48 @@ def parse_hifiasm_extra(extra):
     return pinned, passthrough
 
 
+def dual_scaf_supported(hic1=None, hic2=None, ul=None, primary=False):
+    """
+    Whether ``--dual-scaf`` can change the assembly hifimizer scores.
+
+    hifiasm only scaffolds inside its dual-haplotype output path
+    (``output_trio_graph_joint`` in 0.25.0's Overlaps.cpp), so it can only
+    matter where hap1/hap2 are what gets scored: Hi-C and ultra-long runs.
+    In a plain HiFi run the scored ``bp.p_ctg`` is written before that step,
+    and ``--primary`` produces no haplotype pair at all, so in both it would
+    be a search dimension that cannot move the score.
+    """
+    if primary:
+        return False
+    return bool((hic1 and hic2) or ul)
+
+
+def delete_hifiasm_bins(prefix):
+    """
+    Remove every ``.bin`` file hifiasm has cached at ``prefix``.
+
+    hifiasm loads ``*.ec.bin`` / ``*.ovlp.*.bin`` whenever they exist and then
+    skips k-mer filtering, overlap and error correction entirely
+    (``ha_assemble_pair`` in 0.25.0's Assembly.cpp). Those are exactly the
+    stages ``-D``, ``-N`` and ``--max-kocc`` act on, so in ``--sensitive``
+    mode the cache has to go before every run or the sampled values are
+    silently ignored. The Hi-C and ultra-long caches go too: both are built
+    on the corrected reads, so they would be stale the moment those change.
+
+    Returns:
+        The names of the files removed.
+    """
+    prefix = Path(prefix)
+    removed = []
+    for f in sorted(prefix.parent.glob(f"{prefix.name}*.bin")):
+        try:
+            f.unlink()
+            removed.append(f.name)
+        except FileNotFoundError:
+            pass
+    return removed
+
+
 def collect_hifiasm_outputs(prefix, dest_dir, label) -> int:
     """
     Copy the hifiasm outputs sitting at ``prefix`` into ``dest_dir``.
@@ -178,6 +224,10 @@ def build_hifiasm_command(
     D=None,
     N=None,
     max_kocc=None,
+    k=None,
+    w=None,
+    max_od_ec=None,
+    max_od_final=None,
     hic1=None,
     hic2=None,
     ul=None,
@@ -204,11 +254,17 @@ def build_hifiasm_command(
         threads (int): Number of threads to use.
         sensitive (bool): Whether to enable sensitivity parameters.
         D, N, max_kocc (int): Sensitivity-specific tuning parameters.
+        k, w (int), max_od_ec, max_od_final (float): Sensitivity-specific
+            overlap and error-correction parameters (-k, -w, --max-od-ec,
+            --max-od-final); each is emitted only when given. hifiasm
+            refuses ``max_od_ec < max_od_final``, so ``max_od_final`` is
+            capped at ``max_od_ec`` when both are given.
         default_only (bool): If True, build only the default minimal command.
         dual_scaf (bool): Emit --dual-scaf, which lets hifiasm use the
             homologous region in one haplotype to scaffold across a gap in the
-            other. Only meaningful for a dual assembly, so it is ignored
-            without Hi-C reads.
+            other. Only emitted where it can change the scored assembly -- Hi-C
+            and ultra-long runs, never with ``--primary``; see
+            :func:`dual_scaf_supported`.
         extra_args (list): User-supplied hifiasm arguments, appended verbatim
             to every command including the default-parameter baseline. They
             describe the experiment rather than the search, so leaving them off
@@ -220,7 +276,10 @@ def build_hifiasm_command(
     if None in [haploid_genome_size, threads]:
         raise ValueError("haploid_genome_size and threads must be provided.")
 
-    cmd = f"hifiasm -o {prefix} --hg-size {haploid_genome_size}m -t {threads} "
+    # Passed in kilobases: --hg-size takes an integer with a k/m/g suffix, and
+    # whole megabases would round small genomes (4.64 Mb -> 5m).
+    hg_size_kb = max(1, round(float(haploid_genome_size) * 1000))
+    cmd = f"hifiasm -o {prefix} --hg-size {hg_size_kb}k -t {threads} "
 
     if primary:
         cmd += "--primary "
@@ -243,7 +302,7 @@ def build_hifiasm_command(
 
     # Emitted before the default_only return: a user-pinned argument applies to
     # the baseline too, otherwise trial 0 is a baseline for a different assembly.
-    if dual_scaf and hic1 and hic2:
+    if dual_scaf and dual_scaf_supported(hic1, hic2, ul, primary):
         cmd += "--dual-scaf "
 
     if default_only:
@@ -275,6 +334,25 @@ def build_hifiasm_command(
     if sensitive:
         if all(v is not None for v in (D, N, max_kocc)):
             cmd += f"-D {D} -N {N} --max-kocc {max_kocc} "
+        # hifiasm exits with "max_ov_diff_ec shouldn't be smaller than
+        # max_ov_diff_final" (CommandLines.cpp) otherwise. Capping here, where
+        # every trial, rerun and final rebuild builds its command, keeps all of
+        # them identical for the same recorded parameters.
+        if max_od_ec is not None and max_od_final is not None:
+            if max_od_final > max_od_ec:
+                logger.info(
+                    f"--max-od-final {max_od_final} capped at --max-od-ec "
+                    f"{max_od_ec}: hifiasm requires max-od-ec >= max-od-final."
+                )
+                max_od_final = max_od_ec
+        for flag, value in (
+            ("-k", k),
+            ("-w", w),
+            ("--max-od-ec", max_od_ec),
+            ("--max-od-final", max_od_final),
+        ):
+            if value is not None:
+                cmd += f"{flag} {value} "
 
     return (cmd.strip() + tail).strip()
 

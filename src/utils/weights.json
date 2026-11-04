@@ -2,7 +2,6 @@
   "num_contigs": 1.0,
   "length_diff": 0.5,
   "n50": 1.0,
-  "single_copy": 0.2,
   "multi_copy": 0.7,
   "fragmented": 0.7,
   "missing": 1.0,

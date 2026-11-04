@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import fcntl
 import json
 import logging
 import os
@@ -28,12 +29,10 @@ import optuna.visualization as vis
 import plotly.graph_objects as go
 import psutil
 
-# NOTE: `optunahub` is deliberately NOT imported here. It is a hub client that
-# contacts GitHub, so importing it at startup makes every invocation -- even
-# `--help` and `--version` -- block until the network call resolves. On an
-# offline compute node behind a firewall that drops (rather than rejects)
-# packets, that is a multi-minute stall with no output. It is imported lazily
-# in the multi-objective branch, which is the only place it is used.
+# NOTE: `optunahub` is deliberately not used. It is a hub client that contacts
+# GitHub, and on an offline compute node behind a firewall that drops (rather
+# than rejects) packets that is a multi-minute stall with no output. It was
+# only needed for the MOEA/D sampler, which --sampler replaced.
 
 from utils.assembly_eval import AssemblyEvaluator
 from utils.argparser import get_args
@@ -42,14 +41,17 @@ from utils.hifiasm_command import (
     parse_hifiasm_extra,
     build_hifiasm_command,
     collect_hifiasm_outputs,
+    delete_hifiasm_bins,
     run_default_hifiasm_assembly,
 )
 from utils.objective import (
     ObjectiveBuilder,
     haplotype_suffixes,
     log_metric_report_legend,
+    log_weight_groups,
 )
 from utils.optuna_callback import MultiCriteriaConvergenceDetector
+from utils.samplers import SAMPLER_DESCRIPTIONS, build_sampler
 from utils.optuna_plots import write_param_importances
 from utils.paths import RunPaths
 from utils.subprocess_logger import SubprocessLogger, TIMEOUT_EXIT_CODE
@@ -155,9 +157,58 @@ if args.rerun_best and args.force_rerun:
     logging.error("--rerun-best and --force-rerun are mutually exclusive.")
     sys.exit(1)
 
+
+def acquire_output_lock(directory):
+    """
+    Hold an exclusive lock on ``directory`` for the life of this process.
+
+    Two runs sharing an output directory destroy each other: a second run's
+    --force-rerun deletes the first one's study database and work tree
+    mid-trial (SQLite then reports "attempt to write a readonly database").
+    The lock is released by the kernel when the process exits, however it
+    exits, so a killed run never leaves a stale lock behind. Returns the open
+    lock file, which must stay referenced; exits if another run holds it.
+    """
+    lock_path = Path(directory) / ".hifimizer.lock"
+    handle = open(lock_path, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        holder = handle.read().strip() or "unknown process"
+        logging.error(
+            f"Another hifimizer run is already using {directory} ({holder}). "
+            "Running two studies in one output directory corrupts both; wait "
+            "for it to finish, stop it, or use a different --output-dir."
+        )
+        sys.exit(1)
+    except OSError as e:
+        # Some network filesystems do not support flock at all.
+        logging.warning(
+            f"Could not lock {lock_path} ({e}); make sure no other hifimizer "
+            "run uses this output directory."
+        )
+        return handle
+    import socket
+    from datetime import datetime
+
+    handle.seek(0)
+    handle.truncate()
+    handle.write(
+        f"pid {os.getpid()} on {socket.gethostname()}, started "
+        f"{datetime.now():%Y-%m-%d %H:%M:%S}: {' '.join(sys.argv)}\n"
+    )
+    handle.flush()
+    return handle
+
+
+# Taken before anything is created, deleted or run. --dry-run only reads, so
+# it may validate inputs while a real run is in progress.
+OUTPUT_LOCK = None if args.dry_run else acquire_output_lock(output_dir)
+
 KNOWN_GENOME_SIZE = args.genome_size  # megabases
 ploidy = args.ploidy
-GENOME_SIZE_BP = KNOWN_GENOME_SIZE * 1_000_000
+GENOME_SIZE_BP = round(KNOWN_GENOME_SIZE * 1_000_000)
 
 # Per-stage wall-clock budgets. A stage that blows its budget is killed,
 # loses only its own metrics, and is retired for the rest of the study.
@@ -192,7 +243,24 @@ evaluator = AssemblyEvaluator(
     # --primary collapses the output to a single contig set, so the
     # per-haplotype metric names would be asked for and never appear.
     n_haplotypes=2 if ((hic1 and hic2) or (ul and not args.primary)) else 1,
+    bits_cap=args.bits_cap,
 )
+
+if args.burn_in_trials is not None:
+    logging.warning(
+        "--burn-in-trials is ignored: metrics are now scored in bits, which "
+        "are scale-free, so there is no per-metric scale to measure before "
+        "optimising. TPE's own random startup trials take its place."
+    )
+
+if args.sensitive:
+    logging.warning(
+        "--sensitive: -D, -N and --max-kocc only act on hifiasm's overlap and "
+        "error-correction stages, which it skips when cached .bin files exist. "
+        "The cache is therefore deleted before every hifiasm run, and every "
+        "trial recomputes error correction from the raw reads -- expect each "
+        "one to take several times longer than without --sensitive."
+    )
 
 # User-supplied hifiasm arguments. Parsed once, up front, so a typo fails
 # before any assembly runs rather than on the first hifiasm invocation.
@@ -335,9 +403,6 @@ def prepare_shared_inputs():
             "metric."
         )
         evaluator.subset_hic_reads()
-
-
-BURNIN_STUDY_NAME = "burnin"
 
 
 def reset_previous_run():
@@ -556,15 +621,15 @@ objective_builder = ObjectiveBuilder(
     num_hic_reads=args.num_hic_reads,
     hic_min_mapq=args.hic_min_mapq,
     hic_phasing=args.hic_phasing,
-    prune_fc=args.prune_fc,
+    prune_bits=args.prune_bits,
     prune_min_metrics=args.prune_min_metrics,
     hifiasm_extra=args.hifiasm_extra,
+    bits_cap=args.bits_cap,
 )
-# One objective per phase. The burn-in one runs trial 0 with default
-# parameters, samples the rest at random, prunes nothing, and is scored on raw
-# fold changes -- it exists to measure the scales the other one divides by.
-burnin_objective = objective_builder.build_objective(burn_in=True)
-objective = objective_builder.build_objective(burn_in=False)
+# A single objective for the whole study. Trial 0 is hifiasm with default
+# parameters and every later trial is scored in bits against it, which needs no
+# scale to be measured first.
+objective = objective_builder.build_objective()
 
 PRIMARY_SUFFIX, EXTRA_SUFFIXES = haplotype_suffixes(hic1, hic2, ul, args.primary)
 
@@ -662,15 +727,9 @@ def format_metrics(metrics, title="Assembly metrics"):
         out += (
             f"  - k-mer completeness (yak)   : "
             f"{metrics['kmer_completeness']:.2f}% (hap1 + hap2 combined)\n"
-            if "kmer_completeness_hap2" in metrics
+            if "qv_hap2" in metrics
             else f"  - k-mer completeness (yak)   : "
                  f"{metrics['kmer_completeness']:.2f}%\n"
-        )
-    if "kmer_completeness_hap2" in metrics:
-        out += (
-            f"  - k-mer completeness per hap : "
-            f"{metrics['kmer_completeness_hap1']:.2f}% (hap1) / "
-            f"{metrics['kmer_completeness_hap2']:.2f}% (hap2)\n"
         )
 
     if total_busco > 0:
@@ -693,6 +752,56 @@ def collect_assembly_outputs(dest_dir, label):
     """Copy the current hifiasm outputs out of work/ into a results directory."""
     collect_hifiasm_outputs(paths.hifiasm_prefix, dest_dir, label)
     return dest_dir
+
+
+# ---------------------------------------------------- final assembly record
+# final_assembly/ outlives the run that built it, and resuming a finished
+# study used to rebuild it from scratch -- a full hifiasm run plus evaluation,
+# to reproduce files already on disk. The record says what the directory
+# holds, so a rebuild happens only when the best trial or the hifiasm flags
+# have changed since.
+def _json_safe(value):
+    return json.loads(json.dumps(value, default=float))
+
+
+def clear_final_assembly_record():
+    """Called before any rebuild, so a failed one cannot vouch for old files."""
+    try:
+        paths.final_assembly_record.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def write_final_assembly_record(trial_number, params, metrics=None):
+    record = {
+        "trial": trial_number,
+        "params": _json_safe(params),
+        "hifiasm_flags": hifiasm_run_fingerprint(),
+        "metrics": _json_safe(metrics) if metrics else None,
+    }
+    try:
+        with open(paths.final_assembly_record, "w") as fh:
+            json.dump(record, fh, indent=2)
+    except OSError as e:
+        logging.warning(f"Could not write {paths.final_assembly_record}: {e}")
+
+
+def matching_final_assembly(trial_number, params):
+    """The record of ``final_assembly/`` if it already holds this trial's build."""
+    try:
+        with open(paths.final_assembly_record) as fh:
+            record = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    gfa = paths.final_assembly_dir / f"final_assembly.{PRIMARY_SUFFIX}.gfa"
+    if (
+        record.get("trial") == trial_number
+        and record.get("params") == _json_safe(params)
+        and record.get("hifiasm_flags") == hifiasm_run_fingerprint()
+        and gfa.exists()
+    ):
+        return record
+    return None
 
 
 def run_hifiasm_with_params(params, trial_label, walltime_hours):
@@ -719,6 +828,16 @@ def run_hifiasm_with_params(params, trial_label, walltime_hours):
         kwargs.setdefault(key, value)
 
     command = build_hifiasm_command(**kwargs) + f" {input_reads}"
+    if args.sensitive:
+        # The cache holds whichever trial ran last, with its own -D/-N/
+        # --max-kocc; rebuilding this parameter set on top of it would load
+        # that trial's corrected reads instead.
+        removed = delete_hifiasm_bins(paths.hifiasm_prefix)
+        if removed:
+            logging.info(
+                f"--sensitive: deleted {len(removed)} cached hifiasm .bin "
+                f"file(s) before rebuilding {trial_label}."
+            )
     logging.info(f"Running hifiasm ({trial_label}):\n{command}")
 
     runner = SubprocessLogger(logs_dir=logs_dir)
@@ -821,12 +940,10 @@ def find_best_trial(study, score_key, regime=None):
         if same:
             candidates = same
 
-    bt_num = study.user_attrs.get("best_trial", None)
-    if bt_num is not None:
-        for t in candidates:
-            if t.number == bt_num:
-                return t, trial_score(t, score_key)
-
+    # Always the highest score among the candidates. The running best stored
+    # by best_tracker_callback is a progress report, not the authority: it
+    # used to be returned as-is whenever it was among the candidates, so a
+    # running best that had been reset wrongly decided the final assembly.
     best_trial, best_score = None, float("-inf")
     for t in candidates:
         score = trial_score(t, score_key)
@@ -887,17 +1004,37 @@ def convergence_callback(study, trial):
         )
 
 
+def previous_stop_reason(study):
+    """
+    Why this study was stopped by an earlier run, or None if it never was.
+
+    Every way a study can stop itself leaves a mark in its user attributes
+    before calling ``study.stop()``: ``converged`` from convergence_callback,
+    ``halted_reason`` from pruned_trials_callback and metric_skip_callback.
+    Running out of --num-trials is deliberately not a stop -- the budget is
+    per invocation, so resuming such a study is how it is extended.
+    """
+    halted = study.user_attrs.get("halted_reason")
+    if halted:
+        return f"halted: {halted}"
+    if study.user_attrs.get("converged"):
+        methods = study.user_attrs.get("converged_methods") or []
+        detail = f" (detected by {', '.join(methods)})" if methods else ""
+        return f"converged{detail}"
+    return None
+
+
 def consecutive_pruned_trials(study):
-    """How many trials in a row have been pruned without one completing."""
-    count = 0
+    """The trials pruned in a row since the last completed one, newest first."""
+    run = []
     for t in sorted(
         study.get_trials(deepcopy=False), key=lambda t: t.number, reverse=True
     ):
         if t.state == optuna.trial.TrialState.COMPLETE:
             break
         if t.state == optuna.trial.TrialState.PRUNED:
-            count += 1
-    return count
+            run.append(t)
+    return run
 
 
 def pruned_trials_callback(study, trial):
@@ -918,7 +1055,8 @@ def pruned_trials_callback(study, trial):
     if trial.user_attrs.get("metric_skip"):
         return  # metric_skip_callback owns that budget
 
-    run = consecutive_pruned_trials(study)
+    pruned = consecutive_pruned_trials(study)
+    run = len(pruned)
     if run < args.max_consecutive_pruned:
         if run and run % 5 == 0:
             logging.warning(
@@ -930,23 +1068,49 @@ def pruned_trials_callback(study, trial):
     if study.user_attrs.get("halted_reason"):
         return
 
-    reason = (
-        f"{run} consecutive trials pruned at the gfastats gate "
-        f"(limit --max-consecutive-pruned={args.max_consecutive_pruned})"
-    )
+    # Trials end up "pruned" for two very different reasons: the gfastats gate
+    # rejected a collapsed assembly, or hifiasm / the evaluation failed before
+    # anything was scored. The stop is the same, the advice is not -- widening
+    # the gate does nothing for a hifiasm that refuses its arguments.
+    gated = [t for t in pruned if t.user_attrs.get("gfastats_gate")]
+    failed = [t for t in pruned if t.user_attrs.get("failure")]
+    limit = f"limit --max-consecutive-pruned={args.max_consecutive_pruned}"
+    if len(gated) == run:
+        reason = f"{run} consecutive trials pruned at the gfastats gate ({limit})"
+        detail = (
+            "Every one of them collapsed on at least "
+            f"{args.prune_min_metrics} of the gated contiguity metrics, by "
+            f"more than {args.prune_bits:.1f} bits against the "
+            "default-parameter assembly. The sampler is not finding usable "
+            "parameter sets, and each rejected trial still costs a full "
+            "hifiasm run.\n"
+            "Raise --max-consecutive-pruned to push on, or --prune-bits to "
+            "widen the gate."
+        )
+    else:
+        causes = [f"{len(failed)} failed before scoring"]
+        if gated:
+            causes.append(f"{len(gated)} pruned at the gfastats gate")
+        reason = (
+            f"{run} consecutive trials produced no score: "
+            f"{', '.join(causes)} ({limit})"
+        )
+        latest = failed[0].user_attrs["failure"] if failed else "see the logs"
+        detail = (
+            f"{len(failed)} of them failed before they could be scored -- "
+            "usually hifiasm exiting with an error, which repeats for every "
+            "parameter set until its cause is fixed.\n"
+            f"Most recent failure (trial {failed[0].number if failed else '?'}): "
+            f"{latest}\n"
+            f"Per-command logs: {logs_dir}"
+        )
     study.set_user_attr("halted_reason", reason)
     logging.warning(
         f"\n{'#' * 72}\n"
-        f"OPTIMIZATION STOPPED - {run} trials pruned in a row\n"
+        f"OPTIMIZATION STOPPED - {run} trials in a row without a score\n"
         f"{'#' * 72}\n"
-        "Every one of them collapsed on at least "
-        f"{args.prune_min_metrics} of the gated contiguity metrics, by more "
-        f"than {args.prune_fc:.1f} log2 units against the default-parameter "
-        "assembly. The sampler is not finding usable parameter sets, and each "
-        "rejected trial still costs a full hifiasm run.\n"
-        "The best trial so far will still be rebuilt and reported. Raise "
-        "--max-consecutive-pruned to push on, or --prune-fc to widen the "
-        "gate.\n"
+        f"{detail}\n"
+        "The best trial so far will still be rebuilt and reported.\n"
         f"{'#' * 72}"
     )
     study.stop()
@@ -1028,18 +1192,34 @@ def best_tracker_callback(study, trial):
         if score_val == float("-inf"):
             return
 
-        # A retired metric stage changes what the weighted sum measures, so the
-        # incumbent best is no longer comparable and has to be re-established.
+        # Only trials scored on the metric set this run currently expects
+        # compete. A trial that lost a metric for its own assembly alone is
+        # skipped rather than allowed to reset the running best: resetting on
+        # every change made a one-off dropout throw away the real best, and
+        # the next ordinary trial became "best" whatever its score. Only a
+        # stage retired for the whole study changes the expected set, and
+        # that is when the incumbent stops being comparable.
         regime = trial.user_attrs.get("metric_regime")
-        previous_regime = study.user_attrs.get("best_regime")
-        if regime is not None and previous_regime is not None and regime != previous_regime:
-            logging.warning(
-                "The set of scored metrics changed at trial "
-                f"{trial.number} (a metric stage was retired). Resetting the "
-                "running best: earlier scores are on a different scale."
-            )
-            study.set_user_attr("best_score", float("-inf"))
-            study.set_user_attr("best_trial", None)
+        if regime is not None:
+            evaluator.reload_stage_state()
+            expected = evaluator.metric_regime()
+            if regime != expected:
+                lost = sorted(set(expected.split(",")) - set(regime.split(",")))
+                logging.warning(
+                    f"Trial {trial.number} was scored without "
+                    f"{', '.join(lost) or 'some metrics'}, so it is not "
+                    "compared for the best trial."
+                )
+                return
+            previous_regime = study.user_attrs.get("best_regime")
+            if previous_regime is not None and previous_regime != expected:
+                logging.warning(
+                    "The set of scored metrics changed at trial "
+                    f"{trial.number} (a metric stage was retired). Resetting "
+                    "the running best: earlier scores are on a different scale."
+                )
+                study.set_user_attr("best_score", float("-inf"))
+                study.set_user_attr("best_trial", None)
 
         best_score = study.user_attrs.get("best_score", float("-inf"))
         if best_score is None:
@@ -1073,154 +1253,18 @@ def best_tracker_callback(study, trial):
         logging.debug(f"best_tracker_callback: unexpected error: {e}")
 
 
-def establish_metric_scales(burnin_study):
-    """
-    Measure how far each metric moves when the parameters change.
-
-    Every burn-in trial except the baseline contributes its fold changes, and
-    the scale is the root mean square of those. Trial 0 is excluded on purpose:
-    its fold change against itself is zero by construction and would only
-    deflate the scale it is supposed to be the centre of.
-    """
-    evaluator.reload_stage_state()
-    keys = list(evaluator.active_weights().keys())
-
-    observations = []
-    for t in burnin_study.get_trials(deepcopy=False):
-        if t.state != optuna.trial.TrialState.COMPLETE:
-            continue
-        if t.user_attrs.get("baseline"):
-            continue
-        observations.append(
-            {
-                k: evaluator.fold_change(k, float(t.user_attrs[k]))
-                for k in keys
-                if k in t.user_attrs
-            }
-        )
-
-    if not observations:
-        return {}
-
-    scales = AssemblyEvaluator.compute_metric_scales(observations, keys)
-    evaluator.save_metric_scales(scales)
-
-    logging.info(
-        f"\nBurn-in complete: {len(observations)} random trial(s) measured "
-        "against the default assembly. Each metric below is now divided by how "
-        "far it typically moved, so a weight buys the same thing on a volatile "
-        "metric as on a steady one."
-    )
-    logging.info(f"\n    {'metric':<26}{'scale (log2FC)':>16}{'n':>5}")
-    for name in sorted(scales):
-        entry = scales[name]
-        logging.info(f"    {name:<26}{entry['scale']:>16.4f}{entry['n']:>5}")
-
-    dropped = sorted(set(keys) - set(scales))
-    if dropped:
-        logging.warning(
-            "These metrics are dropped from the score for the rest of the "
-            f"study: {', '.join(dropped)}.\n"
-            "A metric is dropped when it did not move at all across the "
-            "burn-in -- it cannot tell one parameter set from another, so "
-            "scoring it only adds noise -- or when it was measured too rarely "
-            "to get a scale. The objective is now narrower than weights.json "
-            "describes."
-        )
-
-    logging.info("")
-    return scales
-
-
-def import_burnin_trials(burnin_study, main_study, score_key):
-    """
-    Copy the burn-in trials into the main study, rescored against the scales.
-
-    Optuna fixes a trial's objective value when it is recorded, so a study
-    cannot be rescaled part-way through -- which is exactly what dividing by
-    the scales does. Hence two studies: the burn-in keeps its raw fold-change
-    scores, and its trials are re-scored on the way into the main study, whose
-    values then stay on one stationary scale for the whole run.
-    """
-    keys = list(evaluator.active_weights().keys())
-    imported = 0
-
-    for t in sorted(burnin_study.get_trials(deepcopy=False), key=lambda t: t.number):
-        if t.state != optuna.trial.TrialState.COMPLETE:
-            continue
-
-        metrics = {k: float(t.user_attrs[k]) for k in keys if k in t.user_attrs}
-        attrs = dict(t.user_attrs)
-        attrs["burn_in"] = True
-
-        if args.multi_objective:
-            # The Pareto objectives are raw metric values on independent axes,
-            # where a common scale buys nothing, so they carry over untouched.
-            values = list(t.values)
-        else:
-            score = evaluator.calculate_weighted_sum(metrics)
-            attrs["weighted_score"] = float(score)
-            values = [float(score)]
-
-        # Recomputed rather than copied: the regime recorded during the burn-in
-        # predates any metric being dropped for want of a scale, so it would
-        # match nothing scored afterwards and find_best_trial would exclude
-        # every burn-in trial from the comparison.
-        attrs["metric_regime"] = evaluator.metric_regime(metrics)
-
-        main_study.add_trial(
-            optuna.create_trial(
-                params=t.params,
-                distributions=t.distributions,
-                values=values,
-                user_attrs=attrs,
-                state=optuna.trial.TrialState.COMPLETE,
-            )
-        )
-        imported += 1
-
-    seed_running_best(main_study, score_key)
-    return imported
-
-
-def seed_running_best(study, score_key):
-    """
-    Point the running best at the best imported trial.
-
-    Imported trials never pass through best_tracker_callback, so without this
-    the main study starts with no incumbent and the first trial after the
-    burn-in is crowned best purely for being first.
-    """
-    best, best_score = None, float("-inf")
-    for t in study.get_trials(deepcopy=False):
-        score = trial_score(t, score_key)
-        if score > best_score:
-            best, best_score = t, score
-    if best is None:
-        return
-    study.set_user_attr("best_score", float(best_score))
-    study.set_user_attr("best_trial", best.number)
-    regime = best.user_attrs.get("metric_regime")
-    if regime is not None:
-        study.set_user_attr("best_regime", regime)
-    logging.info(
-        f"Best burn-in trial: {best.number} scoring {best_score:+.4f}"
-        + (
-            " (the default-parameter baseline)"
-            if best.user_attrs.get("baseline")
-            else ""
-        )
-    )
-
-
-def rerun_from_params(params, label, banner, title):
+def rerun_from_params(params, label, banner, title, trial_number):
     """
     Rebuild, archive and evaluate an assembly from a recorded parameter set.
 
     Shared by ``--rerun-best`` and ``--rerun-trial``, which differed only in
-    how they found the parameters. Never returns: it exits the process.
+    how they found the parameters. Always rebuilds -- that is what was asked
+    for -- and records what ``final_assembly/`` now holds, so a later resume
+    knows whether it still matches the best trial. Never returns: it exits
+    the process.
     """
     logging.info(f"\n{'#' * 60}\n{banner}\n{'#' * 60}")
+    clear_final_assembly_record()
     try:
         gfa = run_hifiasm_with_params(params, label, args.trial_walltime)
     except Exception as e:
@@ -1228,10 +1272,12 @@ def rerun_from_params(params, label, banner, title):
         sys.exit(1)
 
     collect_assembly_outputs(paths.final_assembly_dir, "final_assembly")
+    metrics = None
     try:
-        evaluate_and_report(gfa, label, title)
+        metrics = evaluate_and_report(gfa, label, title)
     except Exception as e:
         logging.error(f"{label}: assembly evaluation failed: {e}")
+    write_final_assembly_record(trial_number, params, metrics)
     sys.exit(0)
 
 
@@ -1285,18 +1331,6 @@ try:
             window_size=8,
             significance_level=0.05,
         )
-
-        try:
-            import optunahub  # lazy: contacts the network, offline-hostile
-
-            moead_module = optunahub.load_module(
-                package="samplers/moead", force_reload=False
-            )
-            sampler = moead_module.MOEADSampler(seed=args.seed)
-            logging.info("Using MOEAD sampler for multi-objective optimization")
-        except Exception as e:
-            logging.warning(f"MOEAD not available ({e}), falling back to NSGAIIISampler")
-            sampler = optuna.samplers.NSGAIIISampler(seed=args.seed)
     else:
         directions = ["maximize"]
         # Tuned for log2 fold-change scores, and for actually firing.
@@ -1308,29 +1342,39 @@ try:
         # verdict before trial 30 no matter what the scores did -- and two of
         # four is exactly the quorum. At 8 they are reachable by trial 16.
         #
-        # min_improvement and plateau_threshold are in log2 units, which is
-        # what makes them interpretable: 0.05 is a 3.5% improvement and
-        # negligible, and a run whose scores sit inside a 0.15 band is not
-        # moving. Both used to be effectively zero, so any floating-point
-        # wobble counted as progress and reset the counters.
+        # min_improvement and plateau_threshold are in bits of the weighted
+        # MEAN score, which is what makes them interpretable and the same in
+        # every mode: 0.01 is one metric in a typical run of eight improving
+        # by about a twelfth of a doubling (~6%), and negligible; a run whose
+        # scores sit inside a 0.03 band is not moving. (They were 0.05 and
+        # 0.15 when the score was a sum over ~7 units of weight.)
         convergence_detector = MultiCriteriaConvergenceDetector(
             directions=directions,
             min_trials=args.convergence_warmup,
             stagnation_patience=12,
-            min_improvement=0.05,
+            min_improvement=0.01,
             threshold=0.01,
             patience=10,
-            plateau_threshold=0.15,
+            plateau_threshold=0.03,
             min_plateau_length=8,
             window_size=8,
             significance_level=0.05,
         )
-        # n_startup_trials=0: the burn-in has already supplied
-        # --burn-in-trials random observations, and they are copied into this
-        # study before it starts. Left at Optuna's default of 10, TPE would
-        # sample ten *more* at random before modelling anything.
-        sampler = optuna.samplers.TPESampler(seed=args.seed, n_startup_trials=0)
-        logging.info("Using TPE sampler for single-objective optimization (weighted score)")
+
+    # One sampler choice for both modes. The samplers' own random startup
+    # trials are kept: with no burn-in there are no observations to seed them,
+    # and those first trials are ordinary scored, gated trials of this study.
+    #
+    # Multi-objective runs used to use MOEA/D (fetched from optunahub, falling
+    # back to NSGA-III). Both are generational and need many generations of a
+    # population, which a study of ~100 multi-hour trials never reaches; TPE
+    # handles several objectives itself and is built for small budgets.
+    sampler = build_sampler(args.sampler, args.multi_objective, args.seed)
+    logging.info(
+        f"Using {SAMPLER_DESCRIPTIONS[args.sampler]} (--sampler {args.sampler}) "
+        f"for {'multi' if args.multi_objective else 'single'}-objective "
+        "optimization."
+    )
 
     load_if_exists = not args.force_rerun
 
@@ -1391,6 +1435,7 @@ try:
             f"--rerun-best mode\nBest trial : {_trial.number}\n"
             f"Score      : {_score:.4f}\nParams     : {_params}",
             "Rerun assembly metrics",
+            _trial.number,
         )
 
     # ---------------------------------------------------------- rerun-trial
@@ -1415,160 +1460,160 @@ try:
             f"--rerun-trial mode\nTrial  : {_num}\n"
             f"Score  : {_score:.4f}\nParams : {_params}",
             f"Trial {_num} rerun assembly metrics",
+            _num,
         )
 
-    # ------------------------------------------------------ burn-in phase
-    # Two studies, deliberately. Optuna fixes an objective value when the trial
-    # is recorded, so a single study cannot have its scores rescaled part-way
-    # through -- and rescaling is precisely what dividing by the burn-in scales
-    # does. Keeping the burn-in as its own study in the same database leaves it
-    # resumable while the main study's values stay on one stationary scale,
-    # which is what TPE, best_trial and every convergence detector assume.
-    if not study.get_trials(deepcopy=False):
-        burnin_study = optuna.create_study(
-            study_name=BURNIN_STUDY_NAME,
-            directions=directions,
-            storage=paths.db_uri,
-            load_if_exists=load_if_exists,
-            sampler=optuna.samplers.RandomSampler(seed=args.seed),
-        )
-
-        wanted = 1 + max(0, args.burn_in_trials)
-        already = len(
-            [
-                t
-                for t in burnin_study.get_trials(deepcopy=False)
-                if t.state == optuna.trial.TrialState.COMPLETE
-            ]
-        )
-
-        if already < wanted:
-            logging.info(
+    # ------------------------------------------------------- sampler lock
+    # A study is tied to the sampler it started with. Optuna itself would let a
+    # resumed study switch, but the trials so far were proposed under the
+    # other sampler's model, so the result would be neither one's search --
+    # and comparing samplers is exactly what a user switching is trying to do.
+    # Studies written before the sampler was recorded also predate the
+    # current scoring (bits as a weighted mean, the pseudocounts), so their
+    # scores are on a different scale and cannot be continued either.
+    recorded_sampler = study.user_attrs.get("sampler")
+    if study.get_trials(deepcopy=False):
+        if recorded_sampler is None:
+            logging.error(
                 f"\n{'#' * 72}\n"
-                f"BURN-IN: {wanted - already} trial(s) to run "
-                f"({already} already complete)\n"
+                "CANNOT RESUME - STUDY FROM AN EARLIER HIFIMIZER VERSION\n"
                 f"{'#' * 72}\n"
-                "Trial 0 is hifiasm with default parameters and becomes the "
-                "reference every later trial is compared against. The rest "
-                "sample the search space at random, to measure how far each "
-                "metric actually moves when the parameters change -- which is "
-                "what stops a volatile metric outvoting a steady one later.\n"
-                "None of them are pruned: they define the spread everything "
-                "else is divided by, so cutting the bad tail out of them would "
-                "understate it.\n"
-                "They are kept and carried into the optimisation as its "
-                "starting observations, not discarded.\n"
-                "The .bin files trial 0 writes are reused by every trial here "
-                "and in the optimisation that follows.\n"
+                f"The study in {paths.db_path} records no sampler, so it was "
+                "written by an earlier hifimizer version, which also scored "
+                "trials differently. Its scores are not comparable with new "
+                "ones. Re-run with --force-rerun to start a fresh study.\n"
                 f"{'#' * 72}"
             )
-            burnin_study.optimize(
-                burnin_objective,
-                n_trials=wanted - already,
-                callbacks=[metric_skip_callback, best_tracker_callback],
-            )
-
-        if not paths.baseline_metrics.exists():
-            logging.error(
-                "The burn-in did not produce a default-parameter assembly, so "
-                "there is nothing to score against. Check the logs in "
-                f"{logs_dir}, then re-run with --force-rerun."
-            )
             sys.exit(1)
-
-        metric_scales = establish_metric_scales(burnin_study)
-        if not metric_scales:
+        if recorded_sampler != args.sampler:
             logging.error(
                 f"\n{'#' * 72}\n"
-                "NOTHING TO OPTIMISE - NO METRIC MOVED\n"
+                "CANNOT RESUME - SAMPLER CHANGED\n"
                 f"{'#' * 72}\n"
-                "Every burn-in trial produced the same value as the default "
-                "assembly for every metric, so no metric can tell one "
-                "parameter set from another and there is no spread to score "
-                "against.\n"
-                "\n"
-                "That is a statement about the data, not the search. The usual "
-                "causes:\n"
-                "  - the assembly is already a single contig, so the "
-                "graph-cleaning parameters have nothing left to change\n"
-                "  - --genome-size is wrong, which makes length_diff "
-                "meaningless\n"
-                "  - the read set is too small or too deep for the parameters "
-                "to matter\n"
-                "\n"
-                f"  Baseline assembly: {paths.default_assembly_dir}\n"
-                "\n"
-                "The default-parameter assembly is complete and is the result "
-                f"for this dataset.\n{'#' * 72}"
+                f"This study was optimised with --sampler {recorded_sampler}, "
+                f"and this run asks for --sampler {args.sampler}. A study "
+                "cannot switch samplers part-way: its trials so far were "
+                "proposed by the other sampler, so the result would belong to "
+                "neither. Nothing has been run.\n"
+                f"  - to continue this study    : --sampler {recorded_sampler}\n"
+                f"  - to start over with {args.sampler:<6} : --sampler "
+                f"{args.sampler} --force-rerun\n"
+                f"{'#' * 72}"
             )
             sys.exit(1)
-
-        imported = import_burnin_trials(burnin_study, study, score_key)
-        logging.info(
-            f"Copied {imported} burn-in trial(s) into the main study, rescored "
-            "against those scales. The sampler starts from them rather than "
-            "from scratch."
-        )
     else:
-        # A resumed study must still have both halves of the reference.
-        missing = [
-            str(p)
-            for p in (paths.baseline_metrics, paths.metric_scales)
-            if not p.exists()
-        ]
-        if missing:
-            logging.error(
-                "This study has trials but "
-                + " and ".join(missing)
-                + " is missing, so resumed trials would not be comparable with "
-                "the existing ones. Re-run with --force-rerun."
-            )
-            sys.exit(1)
+        study.set_user_attr("sampler", args.sampler)
+
+    # ----------------------------------------------------- baseline trial
+    # Trial 0 is run on its own first, because nothing after it can be scored
+    # until its metrics are on disk. One study holds everything: bits are the
+    # same function of a trial's metrics at trial 1 as at trial 100, so no
+    # value ever needs rescoring and there is no second study to import from.
+    if not study.get_trials(deepcopy=False):
         logging.info(
-            "Main study already has trials; the burn-in is complete and its "
-            "baseline and scales are being reused. Use --force-rerun to "
-            "measure them again."
+            f"\n{'#' * 72}\n"
+            "BASELINE: trial 0, hifiasm with default parameters\n"
+            f"{'#' * 72}\n"
+            "It becomes the reference every later trial is compared against, "
+            "in bits: +1 is twice as good on that metric, -1 twice as bad. "
+            "Bits mean the same thing on every metric, so the optimisation "
+            "starts straight after it, with no burn-in.\n"
+            "The .bin files it writes are reused by every later trial.\n"
+            f"{'#' * 72}"
+        )
+        study.optimize(
+            objective,
+            n_trials=1,
+            callbacks=[metric_skip_callback, best_tracker_callback],
+        )
+
+    if not paths.baseline_metrics.exists():
+        logging.error(
+            "There is no default-parameter baseline to score against: trial 0 "
+            "did not complete, or this study was started before "
+            f"{paths.baseline_metrics} was written. Check the logs in "
+            f"{logs_dir}, then re-run with --force-rerun."
+        )
+        sys.exit(1)
+
+    # ------------------------------------------------------- stopped study
+    # A study that already stopped itself made a decision: it converged, or
+    # it concluded that further trials would only be wasted. Resuming it used
+    # to quietly overrule that -- a fresh convergence detector knows nothing
+    # of the old history, and a halted_reason that is already set makes both
+    # budget callbacks skip their own study.stop() -- so the next run spent up
+    # to --num-trials hifiasm assemblies relitigating it. One check covers
+    # every mode, single- and multi-objective, since both go through here.
+    stop_reason = previous_stop_reason(study)
+    if stop_reason and args.continue_stopped:
+        logging.warning(
+            f"--continue-stopped: this study had stopped ({stop_reason}). "
+            f"Clearing that and running up to {args.num_trials} more trial(s)."
+        )
+        study.set_user_attr("converged", False)
+        study.set_user_attr("converged_methods", [])
+        study.set_user_attr("halted_reason", None)
+        stop_reason = None
+    elif stop_reason:
+        _completed_before = sum(
+            t.state == optuna.trial.TrialState.COMPLETE
+            for t in study.get_trials(deepcopy=False)
+        )
+        logging.info(
+            f"\n{'#' * 72}\n"
+            "STUDY ALREADY STOPPED - NO NEW TRIALS\n"
+            f"{'#' * 72}\n"
+            f"An earlier run stopped this study: {stop_reason}.\n"
+            f"It holds {len(study.trials)} trial(s), {_completed_before} of "
+            "them completed. No new trials are run; the best of them is "
+            "reported and the final assembly built as usual.\n"
+            "  - to keep optimising this study : --continue-stopped\n"
+            "  - to start again from scratch   : --force-rerun\n"
+            f"{'#' * 72}"
         )
 
     # ----------------------------------------------------------- optimize
-    mode_str = "multi-objective" if args.multi_objective else "single-objective (weighted score)"
-    logging.info(
-        "Starting Optuna %s optimization with up to %d trials.", mode_str, args.num_trials
-    )
-    if args.multi_objective:
+    if stop_reason is None:
+        mode_str = "multi-objective" if args.multi_objective else "single-objective (weighted score)"
         logging.info(
-            "Pareto objectives (%d): %s",
-            len(objective_keys),
-            ", ".join(f"{k} ({d})" for k, d in zip(objective_keys, directions)),
+            "Starting Optuna %s optimization with up to %d trials.", mode_str, args.num_trials
         )
-        logging.info(
-            "  No weights are applied in this mode. Every metric outside this "
-            "set is still measured and logged per trial, but does not steer "
-            "the search."
-        )
-    if not args.multi_objective:
-        log_metric_report_legend()
-    if args.prune_fc > 0 and args.prune_min_metrics > 0:
-        logging.info(
-            f"Early pruning: a trial is abandoned after gfastats once "
-            f"{args.prune_min_metrics} of contig count, N50 and length "
-            f"difference are more than {args.prune_fc:.1f} log2 units worse "
-            f"than the default-parameter assembly (2^{args.prune_fc:.1f} = "
-            f"{2 ** args.prune_fc:.1f}x). The remaining metrics are not run "
-            "for that trial. The study stops after "
-            f"{args.max_consecutive_pruned} such trials in a row.\n"
-        )
+        if args.multi_objective:
+            logging.info(
+                "Pareto objectives (%d): %s",
+                len(objective_keys),
+                ", ".join(f"{k} ({d})" for k, d in zip(objective_keys, directions)),
+            )
+            logging.info(
+                "  No weights are applied in this mode. Every metric outside this "
+                "set is still measured and logged per trial, but does not steer "
+                "the search."
+            )
+        if not args.multi_objective:
+            evaluator.reload_stage_state()
+            log_weight_groups(evaluator)
+            log_metric_report_legend(args.bits_cap)
+        if args.prune_bits > 0 and args.prune_min_metrics > 0:
+            logging.info(
+                f"Early pruning: a trial is abandoned after gfastats once "
+                f"{args.prune_min_metrics} of contig count, N50 and length "
+                f"difference are more than {args.prune_bits:.1f} bits worse "
+                f"than the default-parameter assembly (2^{args.prune_bits:.1f} = "
+                f"{2 ** args.prune_bits:.1f}x). The remaining metrics are not run "
+                "for that trial. The study stops after "
+                f"{args.max_consecutive_pruned} such trials in a row.\n"
+            )
 
-    study.optimize(
-        objective,
-        n_trials=args.num_trials,
-        callbacks=[
-            metric_skip_callback,
-            pruned_trials_callback,
-            best_tracker_callback,
-            convergence_callback,
-        ],
-    )
+        study.optimize(
+            objective,
+            n_trials=args.num_trials,
+            callbacks=[
+                metric_skip_callback,
+                pruned_trials_callback,
+                best_tracker_callback,
+                convergence_callback,
+            ],
+        )
 
     # Count COMPLETE trials, not all of them: a study where every trial was
     # pruned or discarded still has a non-empty `trials` list, and asking it for
@@ -1743,8 +1788,23 @@ try:
             "something other than what you care about.\n"
             f"{'#' * 72}"
         )
+    elif matching_final_assembly(best_trial.number, trial_params(best_trial)):
+        record = matching_final_assembly(best_trial.number, trial_params(best_trial))
+        logging.info(
+            f"final_assembly/ already holds trial {best_trial.number}'s "
+            "assembly, built from the same parameters and hifiasm flags; "
+            "reusing it instead of rebuilding. Use --rerun-best to force a "
+            "rebuild."
+        )
+        if record.get("metrics"):
+            logging.info(
+                format_metrics(
+                    record["metrics"], "Final assembly metrics (from when it was built)"
+                )
+            )
     else:
         best_params = trial_params(best_trial)
+        clear_final_assembly_record()
         try:
             final_gfa = run_hifiasm_with_params(best_params, "best", args.trial_walltime)
         except Exception as e:
@@ -1753,10 +1813,14 @@ try:
 
         if final_gfa is not None:
             collect_assembly_outputs(paths.final_assembly_dir, "final_assembly")
+            final_metrics = None
             try:
-                evaluate_and_report(final_gfa, "best", "Final assembly metrics")
+                final_metrics = evaluate_and_report(
+                    final_gfa, "best", "Final assembly metrics"
+                )
             except Exception as e:
                 logging.error(f"Final assembly evaluation failed: {e}")
+            write_final_assembly_record(best_trial.number, best_params, final_metrics)
 except Exception as e:
     logging.error(f"Final assembly/evaluation failed: {e}")
 

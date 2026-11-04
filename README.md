@@ -1,175 +1,153 @@
 # Hifimizer
 
-**Hifimizer** is a framework for optimizing *de novo genome assembly* parameters using Bayesian optimization.
-It wraps **hifiasm** in an automated optimization loop powered by **Optuna**, enabling systematic exploration
-of the assembly parameter space instead of manual trial-and-error.
+**Hifimizer finds better hifiasm parameters for your data.** It assembles your reads with hifiasm's
+defaults, then runs a Bayesian search (Optuna) over hifiasm's graph-cleaning, purging and — for Hi-C or
+ultra-long runs — phasing parameters, scoring every candidate assembly against that default one. It
+reports the best parameter set and builds the final assembly with it, or tells you plainly when
+the defaults were already the best choice.
 
-The primary goal is to identify parameter configurations that improve assembly quality for a given dataset,
-scored across contiguity, gene-space completeness (compleasm/BUSCO), k-mer completeness and consensus accuracy
-(yak), and — for Hi-C runs — **phasing consistency**.
+Works with **PacBio HiFi**, **ONT R10 simplex** (`--ont`), **Hi-C** integration (`--hic1`/`--hic2`) and
+**ultra-long ONT** integration (`--ul`), in dual-haplotype or `--primary` mode.
 
-Hifimizer supports standard **PacBio HiFi**, **Hi-C** integrated, **ultra-long ONT** integrated,
-and **ONT R10 simplex** assemblies.
-
-> For the full details on scoring, pruning, Hi-C phasing internals, walltime controls, tuning the objective,
-> and the output directory layout, see the **[Hifimizer Wiki](../../wiki)**.
+Version **2.0.1** — see the [wiki](../../wiki) for scoring details and what changed since 2.0.0.
 
 ---
 
-## Core idea
+## How it works
 
-Genome assemblers use dozens of parameters, many of which interact non-linearly.
-Hifimizer treats assembly as an optimization problem:
+```mermaid
+flowchart LR
+    A["Trial 0<br/>hifiasm defaults"] --> B["Measure baseline<br/>contiguity · genes · k-mers · phasing"]
+    B --> C["Sampler proposes<br/>parameters"]
+    C --> D["hifiasm"]
+    D --> E{"gfastats gate:<br/>contiguity collapsed?"}
+    E -- yes --> P["prune<br/>(seconds, not hours)"] --> C
+    E -- no --> F["Score vs. baseline<br/>in bits"]
+    F --> G{"Converged or<br/>budget used?"}
+    G -- no --> C
+    G -- yes --> H["Final assembly<br/>with best parameters"]
+```
 
-- parameter space → hifiasm arguments
-- objective function → assembly quality relative to the default assembly
-- optimizer → Bayesian optimization (Optuna)
+1. **Trial 0 is plain hifiasm.** Every later assembly is compared with it, so a positive score means
+   *better than the defaults* and the best trial being trial 0 means the defaults won.
+2. **Each metric is scored in bits:** +1 means twice as good as the default assembly, −1 twice as bad —
+   the same unit for contig count, N50, missing genes and the QV error rate. The score is their
+   importance-weighted mean.
+3. **Collapsed assemblies are pruned after gfastats**, before the expensive k-mer and gene-space stages.
+4. **The study stops** when the score stops improving, or after `--num-trials` trials.
+5. **hifiasm's error-correction cache is reused** across trials, so each trial pays for graph
+   construction, not for error correction (except in `--sensitive` mode, see below).
 
-Trial 0 runs hifiasm with default parameters. A short **burn-in** of random parameter sets then measures how
-far each metric actually moves. Every subsequent trial is scored as a fold change against that baseline,
-divided by that metric's measured movement. A multi-criteria convergence detector stops the study early once
-the score stops improving.
+## What gets tuned
 
-See **[Scoring: fold change against the default assembly](../../wiki/Home#scoring)** on the
-wiki for the full mechanics, including why log2 fold change is used and how the burn-in scale is computed.
+| Mode | Parameters |
+| --- | --- |
+| always | `-x` `-y` `-s` `-n` `-m` `-p` `-u` |
+| Hi-C | `--s-base` `--f-perturb` `--l-msjoin` |
+| Hi-C or ultra-long, not `--primary` | `--dual-scaf` |
+| ultra-long | `--path-max` `--path-min` |
+| `--sensitive` | `-D` `-N` `--max-kocc` `-k` `-w` `--max-od-ec` `--max-od-final` |
 
-> **Note**
->
-> Due to the stochastic nature of Bayesian optimization and adaptive sampling,
-> the *exact sequence of trials and the final best solution* may vary between runs,
-> even when random seeds are set.
+Any of them can be fixed instead of tuned by passing it through `--hifiasm-extra` (e.g.
+`--hifiasm-extra "-s 0.5"`); arguments hifimizer does not tune are passed to every hifiasm run unchanged.
 
-### Workflow overview
+## What gets measured
 
-![Hifimizer workflow](flowchart.svg)
-
----
-
-## What gets evaluated
-
-Directions live in `src/optim_directions.json`; importances live in `weights.json`
-(see the wiki's [Tuning the objective](../../wiki/Home#tuning-the-objective) section).
-
-| Source | Metric | Meaning |
+| Group | Metrics | Tool |
 | --- | --- | --- |
-| **gfastats** | `n50` | Contig N50 (contiguity) |
-| | `num_contigs` | Number of contigs (fragmentation) |
-| | `length_diff` | \|assembly length − expected haploid size\| |
-| **compleasm** / **BUSCO** | `single_copy` | Complete single-copy markers |
-| | `multi_copy` | Complete duplicated markers |
-| | `fragmented` | Fragmented markers (plus compleasm's *incomplete* class) |
-| | `missing` | Missing markers |
-| **yak** | `qv` | Consensus accuracy (Phred-scaled) from read k-mers |
-| | `kmer_completeness` | Fraction of solid read k-mers present in the assembly |
-| **Hi-C phasing** | `trans_hap_rate` | Percent of Hi-C links crossing between haplotypes |
-| | `hic_pairs_informative` | How many pairs that rate was computed from (unweighted) |
+| Contiguity | `num_contigs`, `n50`, `length_diff` (per haplotype in phased runs) | gfastats |
+| Gene space | `missing`, `fragmented`, `multi_copy` | compleasm, falling back to BUSCO |
+| Accuracy | `qv`, `kmer_completeness` | yak |
+| Phasing (Hi-C only) | `trans_hap_rate` | minimap2 + samtools |
 
-Evaluation is alignment-free apart from Hi-C phasing, and two-haplotype runs are scored per haplotype rather
-than averaged — see the wiki for the reasoning and the trade-offs involved (notably, what this design gives up
-in terms of misassembly detection).
+Every run logs how much of the score each group carries, and every trial report splits its score by group.
+To change the balance, edit `weights.json` — preferably a whole group at a time. Details:
+[scoring on the wiki](../../wiki/Home#scoring).
 
 ---
 
-## Installation options
+## Installation
 
-### Option 1: Conda (native execution)
+**Docker / Apptainer** (all tools included):
 
 ```bash
-conda env create -f environment.yml
+docker pull fka21/hifimizer:2.0.1
+docker run --rm -v "$PWD":/wd fka21/hifimizer:2.0.1 src/hifimizer.py -h
+
+apptainer exec docker://fka21/hifimizer:2.0.1 python3 /opt/project/src/hifimizer.py -h
+```
+
+**Conda:**
+
+```bash
+conda env create -f environment.yml            # hifimizer, hifiasm, yak, BUSCO, ...
+conda env create -f environment.compleasm.yml  # compleasm needs its own environment
 conda activate optimizer
 python3 src/hifimizer.py -h
 ```
 
-### Option 2: Docker
-
-```bash
-docker pull fka21/hifimizer:latest
-
-docker run --rm -v $(pwd):/wd fka21/hifimizer:latest src/hifimizer.py -h
-```
-
-> **Note**
->
-> If the HPC environment restricts internet connection, download lineage directly *a priori*, and pass
-> `--compleasm-download-path` (for compleasm, the default backend) or `--busco-download-path` (for the BUSCO
-> fallback). The two are **not** interchangeable. Only the primary backend's dataset is fetched at startup.
-
----
-
-## Requirements
-
-* Long reads: **PacBio HiFi**, or **ONT R10 simplex** (with `--ont`)
-* A haploid genome size estimate
-* Optionally: **Hi-C** reads (`--hic1`/`--hic2`) and/or **ultra-long ONT** reads (`--ul`)
-* Sufficient computational power for repeated assemblies
-* Patience
-
----
-
 ## Quick start
 
 ```bash
-python3 src/hifimizer.py \
-  --genome-size 1.2G \
-  --input-reads reads.hifi.fastq.gz \
-  --threads 48 \
-  --output-dir my_run
+# PacBio HiFi
+python3 src/hifimizer.py --input-reads hifi.fq.gz --genome-size 1.2G \
+    --busco-lineage vertebrata_odb12 --threads 48 --output-dir run1
+
+# HiFi + Hi-C (also tunes and scores phasing)
+python3 src/hifimizer.py --input-reads hifi.fq.gz --genome-size 3G \
+    --hic1 hic_R1.fq.gz --hic2 hic_R2.fq.gz --num-hic-reads 2000000 --output-dir run2
+
+# ONT R10 simplex
+python3 src/hifimizer.py --input-reads ont.fq.gz --genome-size 300M --ont --output-dir run3
+
+# Check inputs and tools without assembling anything
+python3 src/hifimizer.py --input-reads hifi.fq.gz --genome-size 1.2G --dry-run
 ```
 
-ONT R10 simplex:
+### Choices that matter
 
-```bash
-python3 src/hifimizer.py --genome-size 300M --input-reads reads.ont.fastq.gz --ont
-```
+- **`--busco-lineage`** — the default is `metazoa_odb12`. Pick the lineage closest to your organism
+  (`bacteria_odb12`, `poales_odb12`, …); with the wrong one, nearly all genes come back missing and the
+  gene-space metrics carry no signal.
+- **`--genome-size`** — the haploid size (`4.64m`, `750k`, `3G`); it is hifiasm's `--hg-size` and the
+  target `length_diff` is measured against.
+- **`--sampler`** — `tpe` (default, multivariate TPE), `gp` (Gaussian-process Bayesian optimisation,
+  single-objective only), or `random` (a baseline to compare against, not a tuned result).
+- **`--sensitive`** — also tunes the k-mer, overlap and error-correction parameters. These only take
+  effect if error correction is redone, so every trial does it again: expect each trial to be several
+  times slower.
+- **`--multi-objective`** — optimise a Pareto front (N50, missing genes, QV, length difference, plus
+  trans-haplotype rate with Hi-C) instead of a single score.
+- **Offline clusters** — download the lineage beforehand and pass `--compleasm-download-path` and/or
+  `--busco-download-path`. The two formats are not interchangeable.
 
-Hi-C integrated assembly (also optimizes `--s-base`, `--f-perturb`, `--l-msjoin`, and scores their effect via
-`trans_hap_rate`):
+## Resuming and reruns
 
-```bash
-python3 src/hifimizer.py \
-  --genome-size 3G --input-reads hifi.fq.gz \
-  --hic1 hic_R1.fq.gz --hic2 hic_R2.fq.gz \
-  --num-hic-reads 2000000
-```
+Everything is kept in the output directory, so running the same command again **resumes** the study:
 
-Validate inputs and environment without assembling anything:
+- a study that **converged or was halted** runs no new trials (add `--continue-stopped` to keep going);
+- a study that **ran out of `--num-trials`** runs up to `--num-trials` more;
+- the final assembly is **rebuilt only if the best trial changed** since it was built.
 
-```bash
-python3 src/hifimizer.py --genome-size 300M --input-reads reads.fq.gz --dry-run
-```
-
-The genome size accepts a suffix — `3G`, `1.5Gb`, `300M`, `750k` — or a bare integer interpreted as megabases.
-
----
-
-## Reruns and resuming
-
-Hifimizer persists its study in `optuna_study.db`, so runs are resumable and specific results can be
-reproduced without re-optimizing (`--force-rerun`, `--rerun-best`, `--rerun-trial N`). See the wiki's
-[Reruns and resuming](../../wiki/Home#reruns-and-resuming) section for details on what is
-required to resume a study.
-
----
+`--force-rerun` starts over, `--rerun-best` / `--rerun-trial N` rebuild one parameter set without
+optimising. A study keeps the `--sampler` it started with, and only one hifimizer run may use an output
+directory at a time.
 
 ## Output
 
-By default an `output/` directory is created in the current working directory. **Final results live directly
-under the output directory; all intermediates live under `work/` and can be deleted to reclaim space** (at the
-cost of a full hifiasm recompute on the next run).
+```
+output/
+├── final_assembly/        best assembly (+ final_assembly.json: which trial and parameters built it)
+├── default_assembly/      hifiasm with default parameters (trial 0)
+├── logs/                  main.log and one log per command and trial
+├── optuna_output/         optimisation history, parameter importances, per-metric plots
+├── optuna_study.db        every trial, its parameters and metrics
+└── work/                  intermediates; safe to delete (costs a full recompute next time)
+```
 
-The full directory layout, including the contents of `work/`, is documented on the
-[wiki](../../wiki/Home#output-directory-layout).
-
-If the best trial turns out to be trial 0, no final assembly is built: the default assembly already on disk
-*is* the result, and the log says so rather than spending another hifiasm run reproducing it.
+If trial 0 wins, no final assembly is built — use `default_assembly/`.
 
 ---
 
-## Manual
-
-Run `python3 src/hifimizer.py --help` for the full option descriptions, which are kept in the parser rather
-than duplicated here.
-
-## License
-
-Hifimizer is released under the [MIT License](LICENSE).
+Run `python3 src/hifimizer.py --help` for every option. Hifimizer is released under the
+[MIT License](LICENSE).

@@ -74,6 +74,11 @@ class RunPaths:
         return self.output_dir / "best_params_checkpoint.json"
 
     @property
+    def final_assembly_record(self) -> Path:
+        """Which trial, parameters and hifiasm flags ``final_assembly/`` was built from."""
+        return self.final_assembly_dir / "final_assembly.json"
+
+    @property
     def subset_reads(self) -> Path:
         return self.reads_dir / "subset_reads.fa"
 
@@ -106,17 +111,6 @@ class RunPaths:
         measure its own baseline rather than score against the previous one's.
         """
         return self.cache_dir / "baseline_metrics.json"
-
-    @property
-    def metric_scales(self) -> Path:
-        """
-        Per-metric fold-change scale measured during the burn-in.
-
-        Lives beside ``baseline_metrics.json`` for the same reason: the two are
-        only meaningful together, and ``--force-rerun`` wipes ``work/`` so a
-        fresh run measures both again.
-        """
-        return self.cache_dir / "metric_scales.json"
 
     @property
     def hifiasm_fingerprint(self) -> Path:
