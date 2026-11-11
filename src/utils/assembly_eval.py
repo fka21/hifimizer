@@ -361,6 +361,9 @@ class AssemblyEvaluator:
         hic_phasing=True,
         n_haplotypes=1,
         bits_cap=BITS_CAP,
+        weights_file=None,
+        weights=None,
+        weights_source=None,
     ):
         """
         Args:
@@ -392,6 +395,12 @@ class AssemblyEvaluator:
                 derived from ``trial_id``.
             bits_cap: Soft cap on each metric's bits; see :data:`BITS_CAP`.
                 0 or ``None`` disables it.
+            weights_file: The weights.json to load; None means the bundled
+                defaults. A path that does not exist raises
+                FileNotFoundError.
+            weights: Already-loaded weights to use as-is (with
+                ``weights_source``), so per-trial evaluators score with the
+                weights the run started with instead of re-reading the file.
         """
         self.known_genome_size = known_genome_size
         self.input_reads = Path(input_reads)
@@ -448,8 +457,12 @@ class AssemblyEvaluator:
         self.logger = logging.getLogger(f"AssemblyEval_{label}")
 
         self._compile_patterns()
-        self.weights_source = "built-in defaults"
-        self.weights = self._load_weights()
+        if weights is not None:
+            self.weights = dict(weights)
+            self.weights_source = weights_source or "the run's weights"
+        else:
+            self.weights_source = "built-in defaults"
+            self.weights = self._load_weights(weights_file)
 
         # Cache of which BUSCO gene-prediction backend actually works in this
         # environment, so a failing one is only paid for once.
@@ -2043,8 +2056,17 @@ class AssemblyEvaluator:
         return metrics
 
     # ---------------------------------------------------------------- scoring
-    def _load_weights(self):
-        """Load metric weights from weights.json, falling back to defaults."""
+    def _load_weights(self, weights_file=None):
+        """
+        Load metric weights from ``weights_file``, or the bundled weights.json,
+        falling back to built-in defaults.
+
+        Which file to use is decided once, by hifimizer at startup (--weights,
+        then weights.json in the launch directory, then in the output
+        directory). It used to be looked up here, in the current directory --
+        which hifimizer had already changed to the output directory, so a
+        weights.json next to the user's command was silently ignored.
+        """
         # Importances, not signed weights. Direction is already handled: every
         # metric is scored as a log2 fold change signed so that positive means
         # better, so a weight here answers one question -- what is a doubling
@@ -2085,11 +2107,15 @@ class AssemblyEvaluator:
             "trans_hap_rate": 1.0,
         }
 
-        candidates = [
-            Path.cwd() / "weights.json",
-            Path(__file__).parent / "weights.json",
-            Path(__file__).resolve().parents[2] / "weights.json",
-        ]
+        if weights_file is not None:
+            if not Path(weights_file).is_file():
+                raise FileNotFoundError(f"weights file not found: {weights_file}")
+            candidates = [Path(weights_file)]
+        else:
+            candidates = [
+                Path(__file__).parent / "weights.json",
+                Path(__file__).resolve().parents[2] / "weights.json",
+            ]
 
         log = logging.getLogger("AssemblyEval")
 
@@ -2151,9 +2177,7 @@ class AssemblyEvaluator:
                         f"{', '.join(sorted(default_weights))}."
                     )
 
-                # The first candidate is the *current working directory*, which
-                # hifimizer has already chdir'ed into the output directory, so
-                # say out loud which file actually won.
+                # Logged by every run, so which file won is never a guess.
                 self.weights_source = str(candidate)
                 log.debug(f"Loaded metric weights from {candidate}")
                 return validated

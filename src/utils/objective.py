@@ -11,6 +11,7 @@ from utils.hifiasm_command import (
     collect_hifiasm_outputs,
     delete_hifiasm_bins,
     dual_scaf_supported,
+    effective_hifiasm_params,
 )
 from utils.subprocess_logger import SubprocessLogger, TIMEOUT_EXIT_CODE
 from utils.assembly_eval import AssemblyEvaluator, MetricStageFailure, BITS_CAP
@@ -213,6 +214,15 @@ class ObjectiveBuilder:
         self.pinned_params, self.hifiasm_passthrough = parse_hifiasm_extra(
             hifiasm_extra
         )
+        if self.pinned_params.get("dual_scaf") and not dual_scaf_supported(
+            hic1, hic2, ul, primary
+        ):
+            logging.warning(
+                "--dual-scaf from --hifiasm-extra is ignored: it only changes "
+                "the hap1/hap2 output, which this run does not score (it does "
+                "in Hi-C and ultra-long runs without --primary)."
+            )
+            self.pinned_params.pop("dual_scaf")
 
         self.subprocess_logger = SubprocessLogger(logs_dir=paths.logs_dir)
 
@@ -276,6 +286,10 @@ class ObjectiveBuilder:
             compleasm_download_path=self.evaluator.compleasm_download_path,
             use_compleasm=self.evaluator.use_compleasm,
             subset_seed=self.evaluator.subset_seed,
+            # Loaded once, at startup. Re-reading weights.json per trial meant
+            # an edit mid-study silently scored later trials differently.
+            weights=self.evaluator.weights,
+            weights_source=self.evaluator.weights_source,
             ont=self.ont,
             kmer_eval=self.kmer_eval,
             include_busco=self.include_busco,
@@ -461,7 +475,6 @@ class ObjectiveBuilder:
                     "prefix": str(prefix),
                     "haploid_genome_size": self.haploid_genome_size,
                     "threads": self.threads,
-                    "sensitive": self.sensitive,
                     "hic1": self.hic1,
                     "hic2": self.hic2,
                     "ul": self.ul,
@@ -470,15 +483,15 @@ class ObjectiveBuilder:
                     "hom_cov": self.hom_cov,
                 }
                 params = {k: v for k, v in params.items() if v is not None}
-                # default_only stops build_hifiasm_command before the tunable
-                # block. The result is identical to relying on every tunable
-                # being None, but it says so rather than implying it.
+                # hifiasm's own defaults -- except what the user pinned, which
+                # describes the experiment and so applies to the reference
+                # too; otherwise trial 0 is a baseline for another assembly.
+                effective = effective_hifiasm_params(pinned=self.pinned_params)
                 command = (
                     build_hifiasm_command(
-                        default_only=True,
                         extra_args=self.hifiasm_passthrough,
-                        dual_scaf=bool(self.pinned_params.get("dual_scaf", False)),
                         **params,
+                        **effective,
                     )
                     + f" {self.input_reads}"
                 )
@@ -597,30 +610,38 @@ class ObjectiveBuilder:
                         }
                     )
 
+                # Pinned values the mode does not sample (e.g. -k without
+                # --sensitive) are still applied: they were asked for.
+                effective = effective_hifiasm_params(
+                    {
+                        "x": x, "y": y, "s": s, "n": n, "m": m, "p": p, "u": u,
+                        **sensitive_params, **hic_params, **ont_params,
+                    },
+                    self.pinned_params,
+                )
                 command = build_hifiasm_command(
                     prefix=str(prefix),
-                    x=x,
-                    y=y,
-                    s=s,
-                    n=n,
-                    m=m,
-                    p=p,
-                    u=u,
                     haploid_genome_size=self.haploid_genome_size,
                     threads=self.threads,
-                    sensitive=self.sensitive,
                     hic1=self.hic1,
                     hic2=self.hic2,
                     ul=self.ul,
-                    **sensitive_params,
-                    **hic_params,
-                    **ont_params,
                     primary=self.primary,
                     ont=self.ont,
                     hom_cov=self.hom_cov,
                     extra_args=self.hifiasm_passthrough,
+                    **effective,
                 )
                 command += f" {self.input_reads}"
+
+            # Recorded before hifiasm runs, so even a failed or pruned trial
+            # shows what it ran. This -- not trial.params, which holds only the
+            # sampled values, uncapped -- is what reruns replay and what the
+            # best-trial report, checkpoint and final-assembly record show.
+            try:
+                trial.set_user_attr("params", effective)
+            except Exception as e:
+                logging.debug(f"Trial {trial_id}: failed to record params: {e}")
 
             try:
                 if self.sensitive:
@@ -757,7 +778,6 @@ class ObjectiveBuilder:
 
                     try:
                         trial.set_user_attr("aggregate_score", float(agg))
-                        trial.set_user_attr("params", dict(trial.params))
                     except Exception as e:
                         logging.debug(
                             f"Trial {trial_id}: failed to set aggregate user attrs: {e}"
@@ -765,7 +785,7 @@ class ObjectiveBuilder:
 
                     logging.info(
                         f"Trial {trial_id}: Completed successfully. "
-                        f"Params: {dict(trial.params)}"
+                        f"Params: {effective}"
                     )
                     return objective_values
 
@@ -779,7 +799,6 @@ class ObjectiveBuilder:
 
                 try:
                     trial.set_user_attr("weighted_score", float(weighted_score))
-                    trial.set_user_attr("params", dict(trial.params))
                 except Exception as e:
                     logging.debug(
                         f"Trial {trial_id}: failed to set weighted_score user attrs: {e}"
@@ -802,7 +821,6 @@ class ObjectiveBuilder:
                 try:
                     trial.set_user_attr("metric_skip", True)
                     trial.set_user_attr("metric_skip_stage", e.stage_name)
-                    trial.set_user_attr("params", dict(trial.params))
                 except Exception:
                     pass
                 logging.error(

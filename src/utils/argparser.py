@@ -76,7 +76,7 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--version", action="version", version="%(prog)s 2.0.1")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.0.2")
 
     # Required Inputs
     required = parser.add_argument_group("Required arguments")
@@ -106,6 +106,19 @@ def get_args():
         "--threads", type=int, default=40, help="Number of threads to use"
     )
     general.add_argument("--ploidy", type=int, default=2, help="Ploidy of the genome")
+    general.add_argument(
+        "--weights",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "weights.json with the importance of each metric. Without it, a "
+            "weights.json in the directory the command is started from is "
+            "used, then one in --output-dir, then the bundled defaults. The "
+            "file used is logged at the start of every run, and is read once "
+            "per run."
+        ),
+    )
     general.add_argument(
         "--busco-download-path",
         type=str,

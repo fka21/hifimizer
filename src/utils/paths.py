@@ -10,7 +10,7 @@ be deleted without losing a result.
     ├── default_assembly/          final: trial-0 (default hifiasm parameters)
     ├── final_assembly/            final: assembly built from the best parameters
     ├── optuna_output/             final: interactive plots
-    ├── logs/                      final: main.log + per-command logs
+    ├── logs/                      final: run_<time>_<pid>/ per run (main.log + per-command logs), latest -> newest
     ├── optuna_study.db            final: the study
     ├── best_params_checkpoint.json
     └── work/                      intermediate, safe to delete

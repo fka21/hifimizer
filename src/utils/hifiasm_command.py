@@ -18,6 +18,15 @@ HIFIASM_PARAM_KEYS = (
     "dual_scaf",
 )
 
+#: hifimizer parameter name -> hifiasm flag, in the order flags are emitted.
+HIFIASM_PARAM_FLAGS = {
+    "x": "-x", "y": "-y", "s": "-s", "n": "-n", "m": "-m", "p": "-p", "u": "-u",
+    "s_base": "--s-base", "f_perturb": "--f-perturb", "l_msjoin": "--l-msjoin",
+    "path_max": "--path-max", "path_min": "--path-min",
+    "D": "-D", "N": "-N", "max_kocc": "--max-kocc",
+    "k": "-k", "w": "-w", "max_od_ec": "--max-od-ec", "max_od_final": "--max-od-final",
+}
+
 #: hifiasm flag -> (hifimizer parameter name, value type). ``None`` as the type
 #: marks a switch that takes no value. Used to recognise when a user-supplied
 #: argument is pinning something hifimizer would otherwise be optimizing.
@@ -136,6 +145,46 @@ def parse_hifiasm_extra(extra):
     return pinned, passthrough
 
 
+def effective_hifiasm_params(sampled=None, pinned=None):
+    """
+    The tunable parameters a hifiasm run actually uses.
+
+    Pinned values (``--hifiasm-extra``) override sampled ones and apply to
+    every run, trial 0 included. Floats are rounded to 6 decimals, so a
+    stepped value reaches hifiasm as ``0.88`` rather than
+    ``0.8800000000000001``. ``max_od_final`` is capped at ``max_od_ec``, which
+    hifiasm requires (CommandLines.cpp: "max_ov_diff_ec shouldn't be smaller
+    than max_ov_diff_final").
+
+    This is what a trial records and what a rerun replays, so the record and
+    the command can no longer disagree.
+    """
+    params = {**(sampled or {}), **(pinned or {})}
+    for key, value in params.items():
+        if isinstance(value, float):
+            params[key] = round(value, 6)
+    ec, final = params.get("max_od_ec"), params.get("max_od_final")
+    if ec is not None and final is not None and final > ec:
+        logger.info(
+            f"--max-od-final {final} capped at --max-od-ec {ec}: hifiasm "
+            "requires max-od-ec >= max-od-final."
+        )
+        params["max_od_final"] = ec
+    return params
+
+
+def format_hg_size(megabases):
+    """
+    ``--hg-size`` as hifiasm reads it: ``1650m`` for whole megabases, else kb.
+
+    hifiasm parses the number with atof and multiplies by the suffix
+    (inter_gsize in CommandLines.cpp), so both forms are exact; whole
+    megabases are just easier to read in a log.
+    """
+    kb = max(1, round(float(megabases) * 1000))
+    return f"{kb // 1000}m" if kb % 1000 == 0 else f"{kb}k"
+
+
 def dual_scaf_supported(hic1=None, hic2=None, ul=None, primary=False):
     """
     Whether ``--dual-scaf`` can change the assembly hifimizer scores.
@@ -220,7 +269,6 @@ def build_hifiasm_command(
     u=None,
     haploid_genome_size=None,
     threads=None,
-    sensitive=False,
     D=None,
     N=None,
     max_kocc=None,
@@ -237,7 +285,6 @@ def build_hifiasm_command(
     path_max=None,
     path_min=None,
     primary=False,
-    default_only=False,
     ont=False,
     hom_cov=None,
     dual_scaf=False,
@@ -248,18 +295,17 @@ def build_hifiasm_command(
 
     Args:
         prefix (str): Output prefix.
-        x, y, s (float): Hifiasm parameters controlling graph simplification.
-        n, m, p (int): Hifiasm internal parameters.
-        haploid_genome_size (int): Haploid genome size in megabases.
+        x, y, s, n, m, p, u, D, N, max_kocc, k, w, max_od_ec, max_od_final,
+        s_base, f_perturb, l_msjoin, path_max, path_min: hifiasm's tunable
+            parameters. **Each one given is emitted; each one left as None is
+            hifiasm's default.** Which ones a run samples is the caller's
+            decision -- this function does not second-guess it, because
+            silently dropping a value someone asked for is how a pinned
+            parameter used to vanish. They pass through
+            :func:`effective_hifiasm_params` (rounding, the max-od cap).
+            Trial 0 passes only the pinned values.
+        haploid_genome_size (float): Haploid genome size in megabases.
         threads (int): Number of threads to use.
-        sensitive (bool): Whether to enable sensitivity parameters.
-        D, N, max_kocc (int): Sensitivity-specific tuning parameters.
-        k, w (int), max_od_ec, max_od_final (float): Sensitivity-specific
-            overlap and error-correction parameters (-k, -w, --max-od-ec,
-            --max-od-final); each is emitted only when given. hifiasm
-            refuses ``max_od_ec < max_od_final``, so ``max_od_final`` is
-            capped at ``max_od_ec`` when both are given.
-        default_only (bool): If True, build only the default minimal command.
         dual_scaf (bool): Emit --dual-scaf, which lets hifiasm use the
             homologous region in one haplotype to scaffold across a gap in the
             other. Only emitted where it can change the scored assembly -- Hi-C
@@ -276,10 +322,10 @@ def build_hifiasm_command(
     if None in [haploid_genome_size, threads]:
         raise ValueError("haploid_genome_size and threads must be provided.")
 
-    # Passed in kilobases: --hg-size takes an integer with a k/m/g suffix, and
-    # whole megabases would round small genomes (4.64 Mb -> 5m).
-    hg_size_kb = max(1, round(float(haploid_genome_size) * 1000))
-    cmd = f"hifiasm -o {prefix} --hg-size {hg_size_kb}k -t {threads} "
+    cmd = (
+        f"hifiasm -o {prefix} --hg-size {format_hg_size(haploid_genome_size)} "
+        f"-t {threads} "
+    )
 
     if primary:
         cmd += "--primary "
@@ -300,59 +346,22 @@ def build_hifiasm_command(
     # above, hifiasm's getopt takes the later occurrence -- the user's.
     tail = (" " + " ".join(str(a) for a in extra_args)) if extra_args else ""
 
-    # Emitted before the default_only return: a user-pinned argument applies to
-    # the baseline too, otherwise trial 0 is a baseline for a different assembly.
     if dual_scaf and dual_scaf_supported(hic1, hic2, ul, primary):
         cmd += "--dual-scaf "
 
-    if default_only:
-        return (cmd.strip() + tail).strip()
-
     # --- tunable parameters ----------------------------------------------
-    # All six are emitted together or not at all: hifiasm's graph-cleaning
-    # parameters are only meaningful as a set.
-    if all(v is not None for v in (x, y, s, n, m, p)):
-        cmd += f"-x {x} -y {y} -s {s} -n {n} -m {m} -p {p} "
-
-    if u is not None:
-        cmd += f"-u {u} "
-
-    if hic1 and hic2:
-        if s_base is not None:
-            cmd += f"--s-base {s_base} "
-        if f_perturb is not None:
-            cmd += f"--f-perturb {f_perturb} "
-        if l_msjoin is not None:
-            cmd += f"--l-msjoin {l_msjoin} "
-
-    if ul:
-        if path_max is not None:
-            cmd += f"--path-max {path_max} "
-        if path_min is not None:
-            cmd += f"--path-min {path_min} "
-
-    if sensitive:
-        if all(v is not None for v in (D, N, max_kocc)):
-            cmd += f"-D {D} -N {N} --max-kocc {max_kocc} "
-        # hifiasm exits with "max_ov_diff_ec shouldn't be smaller than
-        # max_ov_diff_final" (CommandLines.cpp) otherwise. Capping here, where
-        # every trial, rerun and final rebuild builds its command, keeps all of
-        # them identical for the same recorded parameters.
-        if max_od_ec is not None and max_od_final is not None:
-            if max_od_final > max_od_ec:
-                logger.info(
-                    f"--max-od-final {max_od_final} capped at --max-od-ec "
-                    f"{max_od_ec}: hifiasm requires max-od-ec >= max-od-final."
-                )
-                max_od_final = max_od_ec
-        for flag, value in (
-            ("-k", k),
-            ("-w", w),
-            ("--max-od-ec", max_od_ec),
-            ("--max-od-final", max_od_final),
-        ):
-            if value is not None:
-                cmd += f"{flag} {value} "
+    tunables = effective_hifiasm_params(
+        {
+            "x": x, "y": y, "s": s, "n": n, "m": m, "p": p, "u": u,
+            "s_base": s_base, "f_perturb": f_perturb, "l_msjoin": l_msjoin,
+            "path_max": path_max, "path_min": path_min,
+            "D": D, "N": N, "max_kocc": max_kocc,
+            "k": k, "w": w, "max_od_ec": max_od_ec, "max_od_final": max_od_final,
+        }
+    )
+    for key, value in tunables.items():
+        if value is not None:
+            cmd += f"{HIFIASM_PARAM_FLAGS[key]} {value} "
 
     return (cmd.strip() + tail).strip()
 
@@ -370,11 +379,12 @@ def run_default_hifiasm_assembly(
     logs_dir=None,
     hom_cov=None,
     walltime_hours=None,
-    dual_scaf=False,
+    pinned=None,
     extra_args=None,
 ):
     """
-    Run a clean hifiasm assembly with default parameters only.
+    Run a clean hifiasm assembly with default parameters -- plus anything the
+    user pinned with --hifiasm-extra, which applies to every run.
     """
     try:
         command = (
@@ -386,11 +396,10 @@ def run_default_hifiasm_assembly(
                 hic1=hic1,
                 hic2=hic2,
                 ul=ul,
-                default_only=True,
                 ont=ont,
                 hom_cov=hom_cov,
-                dual_scaf=dual_scaf,
                 extra_args=extra_args,
+                **(pinned or {}),
             )
             + f" {input_reads}"
         )

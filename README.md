@@ -49,7 +49,8 @@ flowchart LR
 | `--sensitive` | `-D` `-N` `--max-kocc` `-k` `-w` `--max-od-ec` `--max-od-final` |
 
 Any of them can be fixed instead of tuned by passing it through `--hifiasm-extra` (e.g.
-`--hifiasm-extra "-s 0.5"`); arguments hifimizer does not tune are passed to every hifiasm run unchanged.
+`--hifiasm-extra "-s 0.5"`): a fixed value is used in every run, trial 0 included, and leaves the search.
+Arguments hifimizer does not tune are passed to every hifiasm run unchanged.
 
 ## What gets measured
 
@@ -61,7 +62,8 @@ Any of them can be fixed instead of tuned by passing it through `--hifiasm-extra
 | Phasing (Hi-C only) | `trans_hap_rate` | minimap2 + samtools |
 
 Every run logs how much of the score each group carries, and every trial report splits its score by group.
-To change the balance, edit `weights.json` — preferably a whole group at a time. Details:
+To change the balance, pass your own `weights.json` with `--weights` (or put one in the directory you
+run from) — preferably scaling a whole group at a time. Details:
 [scoring on the wiki](../../wiki/Home#scoring).
 
 ---
@@ -139,7 +141,7 @@ directory at a time.
 output/
 ├── final_assembly/        best assembly (+ final_assembly.json: which trial and parameters built it)
 ├── default_assembly/      hifiasm with default parameters (trial 0)
-├── logs/                  main.log and one log per command and trial
+├── logs/                  one folder per run (main.log + a log per command); latest → newest
 ├── optuna_output/         optimisation history, parameter importances, per-metric plots
 ├── optuna_study.db        every trial, its parameters and metrics
 └── work/                  intermediates; safe to delete (costs a full recompute next time)

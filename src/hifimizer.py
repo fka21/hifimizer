@@ -42,6 +42,7 @@ from utils.hifiasm_command import (
     build_hifiasm_command,
     collect_hifiasm_outputs,
     delete_hifiasm_bins,
+    effective_hifiasm_params,
     run_default_hifiasm_assembly,
 )
 from utils.objective import (
@@ -123,41 +124,6 @@ if _missing:
     sys.exit(1)
 
 # ---------------------------------------------------------------------- paths
-# Final results live directly under output_dir; every intermediate lives under
-# output_dir/work and can be deleted without losing a result.
-paths = RunPaths(args.output_dir).create()
-output_dir = paths.output_dir
-logs_dir = paths.logs_dir
-
-# Kept for backwards compatibility with relative paths a user may pass on the
-# command line after this point; nothing hifimizer writes depends on the CWD.
-os.chdir(output_dir)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(logs_dir / "main.log"), logging.StreamHandler()],
-)
-
-# The exact command this run was launched with, as the very first line of
-# main.log: reproducing a run or diffing two runs' flags otherwise means
-# reconstructing the invocation from args.* after the fact.
-logging.info(f"Command: {' '.join(sys.argv)}")
-
-# Checked here, before anything is created or deleted: --force-rerun wipes the
-# work tree, and doing that only to then reject the flag combination would
-# destroy a study the user was trying to re-use.
-if args.rerun_trial is not None and args.rerun_best:
-    logging.error("--rerun-trial and --rerun-best are mutually exclusive.")
-    sys.exit(1)
-if args.rerun_trial is not None and args.force_rerun:
-    logging.error("--rerun-trial and --force-rerun are mutually exclusive.")
-    sys.exit(1)
-if args.rerun_best and args.force_rerun:
-    logging.error("--rerun-best and --force-rerun are mutually exclusive.")
-    sys.exit(1)
-
-
 def acquire_output_lock(directory):
     """
     Hold an exclusive lock on ``directory`` for the life of this process.
@@ -202,9 +168,77 @@ def acquire_output_lock(directory):
     return handle
 
 
-# Taken before anything is created, deleted or run. --dry-run only reads, so
-# it may validate inputs while a real run is in progress.
+
+def start_run_logs(root, update_latest=True):
+    """
+    A fresh log folder for this run, ``logs/run_<time>_<pid>/``.
+
+    Logs used to be appended to one file per command for the life of the
+    output directory -- across resumes and --force-rerun alike -- so the first
+    block in ``trial_0_hifiasm.log`` could be from a run days older than the
+    one in progress. ``logs/latest`` points at the newest real run.
+    """
+    from datetime import datetime
+
+    run_dir = Path(root) / f"run_{datetime.now():%Y%m%d-%H%M%S}_{os.getpid()}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if update_latest:
+        latest = Path(root) / "latest"
+        try:
+            if latest.is_symlink() or latest.exists():
+                latest.unlink()
+            latest.symlink_to(run_dir.name)
+        except OSError:
+            pass
+    return run_dir
+
+
+# Final results live directly under output_dir; every intermediate lives under
+# output_dir/work and can be deleted without losing a result.
+paths = RunPaths(args.output_dir).create()
+output_dir = paths.output_dir
+
+# Taken before anything is created, deleted or written -- this run's log
+# folder and logs/latest included. --dry-run only reads, so it may validate
+# inputs while a real run is in progress.
 OUTPUT_LOCK = None if args.dry_run else acquire_output_lock(output_dir)
+
+paths.logs_dir = start_run_logs(paths.logs_dir, update_latest=not args.dry_run)
+logs_dir = paths.logs_dir
+
+# Where the command was started, for resolving --weights and finding a
+# weights.json next to the user's command -- before the chdir below hides it.
+LAUNCH_DIR = Path.cwd()
+
+# Kept for backwards compatibility with relative paths a user may pass on the
+# command line after this point; nothing hifimizer writes depends on the CWD.
+os.chdir(output_dir)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(logs_dir / "main.log"), logging.StreamHandler()],
+)
+
+# The exact command this run was launched with, as the very first line of
+# main.log: reproducing a run or diffing two runs' flags otherwise means
+# reconstructing the invocation from args.* after the fact.
+logging.info(f"Command: {' '.join(sys.argv)}")
+
+# Checked here, before anything is created or deleted: --force-rerun wipes the
+# work tree, and doing that only to then reject the flag combination would
+# destroy a study the user was trying to re-use.
+if args.rerun_trial is not None and args.rerun_best:
+    logging.error("--rerun-trial and --rerun-best are mutually exclusive.")
+    sys.exit(1)
+if args.rerun_trial is not None and args.force_rerun:
+    logging.error("--rerun-trial and --force-rerun are mutually exclusive.")
+    sys.exit(1)
+if args.rerun_best and args.force_rerun:
+    logging.error("--rerun-best and --force-rerun are mutually exclusive.")
+    sys.exit(1)
+
+
 
 KNOWN_GENOME_SIZE = args.genome_size  # megabases
 ploidy = args.ploidy
@@ -219,7 +253,28 @@ STAGE_WALLTIMES = {
     "hic_phasing": args.hic_phasing_walltime,
 }
 
+def resolve_weights_file():
+    """
+    The weights.json this run scores with, or None for the bundled defaults.
+
+    --weights PATH if given (relative to where the command was started), else a
+    weights.json in the launch directory, else one in the output directory.
+    """
+    if args.weights:
+        path = Path(args.weights)
+        path = path if path.is_absolute() else LAUNCH_DIR / path
+        if not path.is_file():
+            logging.error(f"--weights: {path} does not exist.")
+            sys.exit(1)
+        return path.resolve()
+    for path in (LAUNCH_DIR / "weights.json", output_dir / "weights.json"):
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
 evaluator = AssemblyEvaluator(
+    weights_file=resolve_weights_file(),
     known_genome_size=GENOME_SIZE_BP,
     input_reads=input_reads,
     paths=paths,
@@ -296,7 +351,7 @@ if args.default_hifiasm:
         logs_dir=logs_dir,
         hom_cov=args.hom_cov,
         walltime_hours=args.trial_walltime,
-        dual_scaf=bool(PINNED_HIFIASM_PARAMS.get("dual_scaf", False)),
+        pinned=PINNED_HIFIASM_PARAMS,
         extra_args=HIFIASM_PASSTHROUGH,
     )
     sys.exit(0)
@@ -348,6 +403,10 @@ if args.dry_run:
             ul=ul,
             ont=args.ont,
             hom_cov=args.hom_cov,
+            # The command trial 0 will really run: hifiasm's defaults plus
+            # whatever --hifiasm-extra pins or passes through.
+            extra_args=HIFIASM_PASSTHROUGH,
+            **effective_hifiasm_params(pinned=PINNED_HIFIASM_PARAMS),
         )
         + f" {input_reads}"
     )
@@ -431,6 +490,14 @@ def reset_previous_run():
                 logging.warning(f"Could not delete the study either: {inner}")
 
     removed = []
+    # The running-best checkpoint belongs to the study being discarded; left in
+    # place it reported the old study's "best" until the new one found its own.
+    try:
+        paths.best_params_checkpoint.unlink()
+        removed.append(paths.best_params_checkpoint.name)
+    except FileNotFoundError:
+        pass
+
     for target in (
         paths.final_assembly_dir,
         paths.default_assembly_dir,
@@ -810,7 +877,6 @@ def run_hifiasm_with_params(params, trial_label, walltime_hours):
         prefix=str(paths.hifiasm_prefix),
         haploid_genome_size=KNOWN_GENOME_SIZE,
         threads=threads,
-        sensitive=args.sensitive,
         primary=args.primary,
         hic1=hic1,
         hic2=hic2,
