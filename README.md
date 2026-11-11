@@ -73,10 +73,10 @@ run from) — preferably scaling a whole group at a time. Details:
 **Docker / Apptainer** (all tools included):
 
 ```bash
-docker pull fka21/hifimizer:2.0.1
-docker run --rm -v "$PWD":/wd fka21/hifimizer:2.0.1 src/hifimizer.py -h
+docker pull fka21/hifimizer:latest
+docker run --rm -v "$PWD":/wd fka21/hifimizer:latest src/hifimizer.py -h
 
-apptainer exec docker://fka21/hifimizer:2.0.1 python3 /opt/project/src/hifimizer.py -h
+apptainer exec docker://fka21/hifimizer:latest python3 /opt/project/src/hifimizer.py -h
 ```
 
 **Conda:**
