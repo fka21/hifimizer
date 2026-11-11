@@ -9,7 +9,7 @@ the defaults were already the best choice.
 Works with **PacBio HiFi**, **ONT R10 simplex** (`--ont`), **Hi-C** integration (`--hic1`/`--hic2`) and
 **ultra-long ONT** integration (`--ul`), in dual-haplotype or `--primary` mode.
 
-Version **2.0.1** — see the [wiki](../../wiki) for scoring details and what changed since 2.0.0.
+Version **2.0.2** — see the [wiki](../../wiki) for scoring details and what changed since 2.0.0.
 
 ---
 
